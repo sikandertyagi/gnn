@@ -17,6 +17,16 @@ def main():
     print("Loading dataset...")
     df = pd.read_csv(DATA_PATH)
 
+    # ------------------------------------------------------------------
+    # Keep only high-signal event types:
+    #   EventID 1 — process creation (strongest attack signal)
+    #   EventID 3 — network connection (C2 / lateral movement)
+    # ------------------------------------------------------------------
+    df["EventID"] = pd.to_numeric(df["EventID"], errors="coerce")
+    before = len(df)
+    df = df[df["EventID"].isin([1, 3])].reset_index(drop=True)
+    print(f"EventID filter  : {before} → {len(df)} rows (kept 1 & 3)")
+
     print("Feature engineering...")
     df, feature_cols = feature_engineering(df)
 
