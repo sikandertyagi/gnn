@@ -1,102 +1,151 @@
 """
 rarity_engine.py
 ────────────────
-Tracks baseline frequency of behavioural patterns observed in benign events
-and computes a rarity score in [0, 1] for new events.
+Tracks baseline frequency of behavioural patterns from benign events and
+computes per-event rarity scores in [0, 1].
 
-Tracked frequencies
-───────────────────
-  parent_child_freq    : (parent_process_name, child_process_name)
-  proc_ip_freq         : (process_name, destination_ip)
-  network_dest_freq    : destination_ip
+Tracked patterns
+────────────────
+  parent_child : (parent_proc_name, child_proc_name)
+  proc_ip      : (process_name, destination_ip)
+  network_dest : destination_ip
 
-All counters are fitted on label=0 (benign) data only.
+Scalability
+───────────
+  fit()            – pandas groupby, O(N) vectorised (no iterrows)
+  score_dataframe() – pandas merge, O(N) vectorised (no iterrows)
+  score_row()      – kept for single-event use (e.g. streaming)
 """
-
-from collections import Counter
 
 import numpy as np
 import pandas as pd
 
 
+_MISSING = "__MISSING__"          # sentinel for NaN join keys
+
+
 class RarityEngine:
 
     def __init__(self):
-        self.parent_child_freq:  Counter = Counter()
-        self.proc_ip_freq:       Counter = Counter()
-        self.network_dest_freq:  Counter = Counter()
+        # DataFrames used for vectorised merge-based scoring
+        self._pc_counts: pd.DataFrame = pd.DataFrame()   # _parent, _child, count
+        self._pi_counts: pd.DataFrame = pd.DataFrame()   # _proc,  DestinationIp, count
+        self._nd_counts: pd.DataFrame = pd.DataFrame()   # DestinationIp, count
 
         self._total_pc: int = 1
         self._total_pi: int = 1
         self._total_nd: int = 1
+        self._vocab_pc: int = 0
+        self._vocab_pi: int = 0
+        self._vocab_nd: int = 0
 
-    # ── fitting ───────────────────────────────────────────────────────────────
+    # ── fitting (vectorised) ──────────────────────────────────────────────────
 
     def fit(self, df: pd.DataFrame) -> "RarityEngine":
-        """Fit counters on benign (Label == 0) rows of *df*."""
+        """Fit on benign (Label == 0) rows using vectorised pandas ops."""
         benign = df[df["Label"] == 0]
 
         # parent → child process pairs
-        pc = benign[["ParentImage", "Image"]].dropna()
-        for _, row in pc.iterrows():
-            parent = _proc_name(row["ParentImage"])
-            child  = _proc_name(row["Image"])
-            self.parent_child_freq[(parent, child)] += 1
-        self._total_pc = max(sum(self.parent_child_freq.values()), 1)
+        pc = benign[["ParentImage", "Image"]].dropna().copy()
+        pc["_parent"] = _extract_name(pc["ParentImage"])
+        pc["_child"]  = _extract_name(pc["Image"])
+        self._pc_counts = (
+            pc.groupby(["_parent", "_child"], sort=False)
+            .size()
+            .reset_index(name="count")
+        )
+        self._total_pc = max(int(self._pc_counts["count"].sum()), 1)
+        self._vocab_pc = len(self._pc_counts)
 
         # process → destination IP
-        pi = benign[["Image", "DestinationIp"]].dropna()
-        for _, row in pi.iterrows():
-            proc = _proc_name(row["Image"])
-            ip   = str(row["DestinationIp"])
-            self.proc_ip_freq[(proc, ip)] += 1
-        self._total_pi = max(sum(self.proc_ip_freq.values()), 1)
+        pi = benign[["Image", "DestinationIp"]].dropna().copy()
+        pi["_proc"] = _extract_name(pi["Image"])
+        pi["DestinationIp"] = pi["DestinationIp"].astype(str)
+        self._pi_counts = (
+            pi.groupby(["_proc", "DestinationIp"], sort=False)
+            .size()
+            .reset_index(name="count")
+        )
+        self._total_pi = max(int(self._pi_counts["count"].sum()), 1)
+        self._vocab_pi = len(self._pi_counts)
 
-        # network destination frequency
-        nd = benign["DestinationIp"].dropna()
-        for ip in nd:
-            self.network_dest_freq[str(ip)] += 1
-        self._total_nd = max(sum(self.network_dest_freq.values()), 1)
+        # network destination
+        nd = benign["DestinationIp"].dropna().astype(str)
+        self._nd_counts = (
+            nd.value_counts()
+            .reset_index()
+            .rename(columns={"index": "DestinationIp", "DestinationIp": "count"})
+        )
+        # pandas ≥2.0 value_counts() columns are already named correctly
+        if "count" not in self._nd_counts.columns:
+            self._nd_counts.columns = ["DestinationIp", "count"]
+        self._total_nd = max(int(self._nd_counts["count"].sum()), 1)
+        self._vocab_nd = len(self._nd_counts)
 
         return self
 
-    # ── scoring ───────────────────────────────────────────────────────────────
-
-    def score_row(self, row: pd.Series) -> float:
-        """Return rarity score in [0, 1] for a single event row."""
-        signals: list = []
-
-        if pd.notna(row.get("ParentImage")) and pd.notna(row.get("Image")):
-            parent = _proc_name(row["ParentImage"])
-            child  = _proc_name(row["Image"])
-            freq   = self.parent_child_freq.get((parent, child), 0)
-            vocab  = len(self.parent_child_freq)
-            p      = (freq + 1) / (self._total_pc + vocab + 1)
-            signals.append(1.0 - p)
-
-        if pd.notna(row.get("Image")) and pd.notna(row.get("DestinationIp")):
-            proc = _proc_name(row["Image"])
-            ip   = str(row["DestinationIp"])
-            freq = self.proc_ip_freq.get((proc, ip), 0)
-            vocab = len(self.proc_ip_freq)
-            p    = (freq + 1) / (self._total_pi + vocab + 1)
-            signals.append(1.0 - p)
-
-        if pd.notna(row.get("DestinationIp")):
-            ip   = str(row["DestinationIp"])
-            freq = self.network_dest_freq.get(ip, 0)
-            vocab = len(self.network_dest_freq)
-            p    = (freq + 1) / (self._total_nd + vocab + 1)
-            signals.append(1.0 - p)
-
-        return float(np.mean(signals)) if signals else 0.0
+    # ── scoring (vectorised) ──────────────────────────────────────────────────
 
     def score_dataframe(self, df: pd.DataFrame) -> np.ndarray:
-        """Vectorised scoring over a DataFrame; returns ndarray of shape (N,)."""
-        return np.array([self.score_row(row) for _, row in df.iterrows()])
+        """
+        Compute rarity score for every row in *df*.
+        Returns ndarray of shape (N,) in [0, 1].
+        Fully vectorised – safe for millions of rows.
+        """
+        N      = len(df)
+        scores = np.full((N, 3), np.nan, dtype=np.float64)
+        idx    = df.index  # preserve original index for alignment
+
+        # ── parent-child rarity ───────────────────────────────────────────────
+        pc_valid = df["ParentImage"].notna() & df["Image"].notna()
+        if pc_valid.any() and not self._pc_counts.empty:
+            tmp = pd.DataFrame({
+                "_parent": _extract_name(df["ParentImage"].fillna(_MISSING)),
+                "_child":  _extract_name(df["Image"].fillna(_MISSING)),
+            }, index=idx)
+            tmp = tmp.merge(self._pc_counts, on=["_parent", "_child"], how="left")
+            freq = tmp["count"].fillna(0).values
+            p    = (freq + 1) / (self._total_pc + self._vocab_pc + 1)
+            scores[:, 0] = np.where(pc_valid.values, 1.0 - p, np.nan)
+
+        # ── process-IP rarity ─────────────────────────────────────────────────
+        pi_valid = df["Image"].notna() & df["DestinationIp"].notna()
+        if pi_valid.any() and not self._pi_counts.empty:
+            tmp = pd.DataFrame({
+                "_proc":        _extract_name(df["Image"].fillna(_MISSING)),
+                "DestinationIp": df["DestinationIp"].fillna(_MISSING).astype(str),
+            }, index=idx)
+            tmp = tmp.merge(self._pi_counts, on=["_proc", "DestinationIp"], how="left")
+            freq = tmp["count"].fillna(0).values
+            p    = (freq + 1) / (self._total_pi + self._vocab_pi + 1)
+            scores[:, 1] = np.where(pi_valid.values, 1.0 - p, np.nan)
+
+        # ── network-destination rarity ────────────────────────────────────────
+        nd_valid = df["DestinationIp"].notna()
+        if nd_valid.any() and not self._nd_counts.empty:
+            tmp = pd.DataFrame({
+                "DestinationIp": df["DestinationIp"].fillna(_MISSING).astype(str),
+            }, index=idx)
+            tmp = tmp.merge(self._nd_counts, on="DestinationIp", how="left")
+            freq = tmp["count"].fillna(0).values
+            p    = (freq + 1) / (self._total_nd + self._vocab_nd + 1)
+            scores[:, 2] = np.where(nd_valid.values, 1.0 - p, np.nan)
+
+        # mean across whichever signals are valid per row; default 0 if none
+        with np.errstate(all="ignore"):
+            result = np.nanmean(scores, axis=1)
+        result = np.where(np.isnan(result), 0.0, result)
+        return result.astype(np.float32)
+
+    # ── single-row scoring (kept for streaming / debugging) ───────────────────
+
+    def score_row(self, row: pd.Series) -> float:
+        """Score a single event row. Prefer score_dataframe() for bulk use."""
+        return float(self.score_dataframe(row.to_frame().T)[0])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _proc_name(path) -> str:
-    return str(path).split("\\")[-1].lower()
+def _extract_name(series: pd.Series) -> pd.Series:
+    """Vectorised equivalent of  str(path).split('\\')[-1].lower()."""
+    return series.astype(str).str.split("\\").str[-1].str.lower()

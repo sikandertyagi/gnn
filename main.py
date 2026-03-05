@@ -16,17 +16,18 @@ Full end-to-end pipeline:
     │       ▼
     │   graph_anomaly_scores      (N_events,)
     │
-    ├─► rarity_engine.py          fitted on benign events
+    ├─► rarity_engine.py          fitted on benign events  [vectorised]
     │       │
     │       ▼
     │   rarity_scores             (N_events,)
     │
     ├─► sequence_builder.py       sliding-window sequences
-    │       │
+    │       │                     small dataset → in-memory ndarray
+    │       │                     large dataset → np.memmap on disk
     │       ▼  transformer_autoencoder.py + train.py
     │   TransformerAutoencoder    trained on benign sequences
     │       │
-    │       ▼  evaluate.py
+    │       ▼  evaluate.py        [batched inference]
     │   reconstruction_errors     (N_sequences,)
     │
     ▼  anomaly_engine.py
@@ -34,6 +35,9 @@ Full end-to-end pipeline:
     │
     ▼  alert_aggregator.py
   Attack-chain alerts CSV
+    │
+    ▼  metrics.py
+  Evaluation report
 """
 
 import numpy as np
@@ -46,14 +50,18 @@ from config import (
     GNN_EPOCHS, GNN_LR,
     MODEL_PATH, GNN_MODEL_PATH,
     SCORES_PATH, ALERTS_PATH,
+    LARGE_DATASET_THRESHOLD, SEQ_MEMMAP_PATH, LABELS_MEMMAP_PATH,
+    INFER_BATCH_SIZE,
 )
 from feature_engineering import feature_engineering
 from graph_builder import build_event_graph, node_feature_dims
-from gnn_encoder import HeteroGNNEncoder, train_gnn, compute_benign_centroids, graph_anomaly_scores
+from gnn_encoder import (HeteroGNNEncoder, train_gnn,
+                         compute_benign_centroids, graph_anomaly_scores)
 from rarity_engine import RarityEngine
-from sequence_builder import build_sequences
+from sequence_builder import (build_sequences, build_sequences_memmap,
+                               load_seq_memmap, load_seq_labels)
 from transformer_autoencoder import TransformerAutoencoder
-from train import train_model
+from train import train_model, train_model_large
 from evaluate import anomaly_scores
 from anomaly_engine import compute_anomaly_scores
 from alert_aggregator import aggregate_alerts
@@ -63,95 +71,121 @@ from metrics import evaluate
 def main():
 
     # ── 1. load data ──────────────────────────────────────────────────────────
-    print("\n[1/8] Loading dataset...")
+    print("\n[1/9] Loading dataset...")
     df = pd.read_csv(DATA_PATH)
-    print(f"      {len(df):,} events loaded")
+    n_events   = len(df)
+    use_memmap = n_events > LARGE_DATASET_THRESHOLD
+    print(f"      {n_events:,} events — "
+          f"{'large dataset: disk-backed (memmap) mode' if use_memmap else 'small dataset: in-memory mode'}")
 
     # ── 2. feature engineering ────────────────────────────────────────────────
-    print("\n[2/8] Feature engineering...")
+    print("\n[2/9] Feature engineering...")
     df, feature_cols = feature_engineering(df)
     print(f"      {len(feature_cols)} feature columns")
 
     # ── 3. build heterogeneous event graph ────────────────────────────────────
-    print("\n[3/8] Building event graph...")
-    df_benign     = df[df["Label"] == TRAIN_LABEL]
-    full_graph, encoders = build_event_graph(df)
-    benign_graph, _      = build_event_graph(df_benign)
+    print("\n[3/9] Building event graph...")
+    df_benign        = df[df["Label"] == TRAIN_LABEL]
+    full_graph,   encoders = build_event_graph(df)
+    benign_graph, _        = build_event_graph(df_benign)
 
-    n_proc = full_graph["process"].x.shape[0]
-    n_ip   = full_graph["ip"].x.shape[0]
-    print(f"      {n_proc} process nodes, {n_ip} IP nodes")
-    pp_edges = full_graph["process", "parent_of", "process"].edge_index.shape[1]
-    pi_edges = full_graph["process", "connects_to", "ip"].edge_index.shape[1]
-    print(f"      {pp_edges} parent→child edges, {pi_edges} process→IP edges")
+    n_proc   = full_graph["process"].x.shape[0]
+    n_ip     = full_graph["ip"].x.shape[0]
+    pp_edges = full_graph["process", "parent_of",   "process"].edge_index.shape[1]
+    pi_edges = full_graph["process", "connects_to", "ip"      ].edge_index.shape[1]
+    print(f"      {n_proc:,} process nodes  {n_ip:,} IP nodes")
+    print(f"      {pp_edges:,} parent→child edges  {pi_edges:,} process→IP edges")
 
     # ── 4. train GNN encoder (benign graph only) ──────────────────────────────
-    print("\n[4/8] Training GNN encoder on benign graph...")
-    feat_dims  = node_feature_dims(benign_graph)
-    gnn_model  = HeteroGNNEncoder(feat_dims)
-    gnn_model  = train_gnn(gnn_model, benign_graph, epochs=GNN_EPOCHS, lr=GNN_LR)
+    print("\n[4/9] Training GNN encoder on benign graph...")
+    feat_dims = node_feature_dims(benign_graph)
+    gnn_model = HeteroGNNEncoder(feat_dims)
+    gnn_model = train_gnn(gnn_model, benign_graph, epochs=GNN_EPOCHS, lr=GNN_LR)
     torch.save(gnn_model.state_dict(), GNN_MODEL_PATH)
     print(f"      Saved → {GNN_MODEL_PATH}")
 
     benign_centroids = compute_benign_centroids(gnn_model, benign_graph)
 
     # ── 5. compute per-event graph anomaly scores ─────────────────────────────
-    print("\n[5/8] Computing graph anomaly scores...")
+    print("\n[5/9] Computing graph anomaly scores...")
     proc_graph_scores = graph_anomaly_scores(
-        gnn_model, full_graph, benign_centroids,
-        encoders["process"]
-    )  # shape: (N_process_nodes,)
+        gnn_model, full_graph, benign_centroids, encoders["process"]
+    )  # (N_process_nodes,)
 
-    # map each event row → its process node score
-    proc_enc      = encoders["process"]
-    event_images  = df["Image"].fillna("unknown").values
-    proc_ids      = proc_enc.transform(event_images)
+    proc_enc           = encoders["process"]
+    event_images       = df["Image"].fillna("unknown").values
+    proc_ids           = proc_enc.transform(event_images)
     event_graph_scores = proc_graph_scores[proc_ids].numpy()
-    print(f"      mean graph score: {event_graph_scores.mean():.4f}")
+    print(f"      mean graph score : {event_graph_scores.mean():.4f}")
 
     # ── 6. fit rarity engine & score all events ───────────────────────────────
-    print("\n[6/8] Fitting rarity engine & scoring...")
-    rarity = RarityEngine().fit(df)
+    print("\n[6/9] Fitting rarity engine & scoring...  [vectorised]")
+    rarity              = RarityEngine().fit(df)
     event_rarity_scores = rarity.score_dataframe(df)
     print(f"      mean rarity score: {event_rarity_scores.mean():.4f}")
 
-    # ── 7. train transformer autoencoder (benign sequences) ───────────────────
-    print("\n[7/8] Building sequences & training Transformer autoencoder...")
-    X, y = build_sequences(df, feature_cols, SEQUENCE_LENGTH)
-    print(f"      {X.shape[0]:,} sequences of length {SEQUENCE_LENGTH}")
+    # ── 7. build sequences & train transformer autoencoder ────────────────────
+    print(f"\n[7/9] Building sequences & training Transformer autoencoder...")
 
-    X_train = X[y == TRAIN_LABEL]
-    print(f"      {X_train.shape[0]:,} benign training sequences")
+    if use_memmap:
+        # ── large-dataset path: stream sequences to disk ──────────────────────
+        print(f"      Writing sequences to {SEQ_MEMMAP_PATH} ...")
+        n_seq, seq_shape = build_sequences_memmap(
+            df, feature_cols, SEQUENCE_LENGTH,
+            SEQ_MEMMAP_PATH, LABELS_MEMMAP_PATH,
+        )
+        print(f"      {n_seq:,} sequences of length {SEQUENCE_LENGTH} written to disk")
 
-    feature_dim = X.shape[2]
-    ta_model    = TransformerAutoencoder(feature_dim)
-    ta_model    = train_model(ta_model, X_train, EPOCHS, BATCH_SIZE, LEARNING_RATE)
-    torch.save(ta_model.state_dict(), MODEL_PATH)
-    print(f"      Saved → {MODEL_PATH}")
+        y            = load_seq_labels(LABELS_MEMMAP_PATH, n_seq)
+        train_indices = np.where(y == TRAIN_LABEL)[0]
+        print(f"      {len(train_indices):,} benign training sequences")
 
-    # reconstruction errors per sequence
-    seq_recon_errors = anomaly_scores(ta_model, X)  # (N_seq,)
+        feature_dim = seq_shape[2]
+        ta_model    = TransformerAutoencoder(feature_dim)
+        ta_model    = train_model_large(
+            ta_model, SEQ_MEMMAP_PATH, seq_shape,
+            train_indices, EPOCHS, BATCH_SIZE, LEARNING_RATE,
+        )
+        torch.save(ta_model.state_dict(), MODEL_PATH)
+        print(f"      Saved → {MODEL_PATH}")
 
-    # align sequences back to events:
-    # build_sequences produces one sequence per event (offset by seq_len-1)
-    # we pad the first (seq_len-1) events with the first sequence's score
-    n_events = len(df)
-    event_recon_errors = np.empty(n_events)
-    pad = n_events - len(seq_recon_errors)
+        X_mm             = load_seq_memmap(SEQ_MEMMAP_PATH, seq_shape)
+        seq_recon_errors = anomaly_scores(ta_model, X_mm, INFER_BATCH_SIZE)
+        n_seq_out        = n_seq
+
+    else:
+        # ── small-dataset path: all in RAM ────────────────────────────────────
+        X, y = build_sequences(df, feature_cols, SEQUENCE_LENGTH)
+        print(f"      {X.shape[0]:,} sequences of length {SEQUENCE_LENGTH}")
+
+        X_train = X[y == TRAIN_LABEL]
+        print(f"      {X_train.shape[0]:,} benign training sequences")
+
+        feature_dim = X.shape[2]
+        ta_model    = TransformerAutoencoder(feature_dim)
+        ta_model    = train_model(ta_model, X_train, EPOCHS, BATCH_SIZE, LEARNING_RATE)
+        torch.save(ta_model.state_dict(), MODEL_PATH)
+        print(f"      Saved → {MODEL_PATH}")
+
+        seq_recon_errors = anomaly_scores(ta_model, X, INFER_BATCH_SIZE)
+        n_seq_out        = len(X)
+
+    # align sequence-level scores back to events
+    # sequences start at event index (seq_len - 1); pad the head with first score
+    event_recon_errors       = np.empty(n_events, dtype=np.float32)
+    pad                      = n_events - n_seq_out
     event_recon_errors[:pad] = seq_recon_errors[0]
     event_recon_errors[pad:] = seq_recon_errors
+    print(f"      mean recon error : {event_recon_errors.mean():.4f}")
 
-    print(f"      mean recon error: {event_recon_errors.mean():.4f}")
-
-    # ── 8. composite anomaly scoring ──────────────────────────────────────────
-    print("\n[8/8] Computing composite anomaly scores & aggregating alerts...")
+    # ── 8. composite anomaly scoring & alerts ─────────────────────────────────
+    print("\n[8/9] Computing composite anomaly scores & aggregating alerts...")
     composite = compute_anomaly_scores(
         event_recon_errors,
         event_graph_scores,
         event_rarity_scores,
     )
 
-    # save per-event scores
     df_scores = pd.DataFrame({
         "score":        composite,
         "recon_error":  event_recon_errors,
@@ -162,11 +196,11 @@ def main():
     df_scores.to_csv(SCORES_PATH, index=False)
     print(f"      Scores saved → {SCORES_PATH}")
 
-    # print per-label summary
     print("\n  Score summary by label:")
-    print(df_scores.groupby("label")[["score", "recon_error", "graph_score", "rarity_score"]].mean().to_string())
+    print(df_scores.groupby("label")[
+        ["score", "recon_error", "graph_score", "rarity_score"]
+    ].mean().to_string())
 
-    # aggregate alerts
     alerts = aggregate_alerts(df, composite)
     alerts.to_csv(ALERTS_PATH, index=False)
     print(f"\n  Alerts saved → {ALERTS_PATH}")
@@ -178,19 +212,20 @@ def main():
         ].to_string(index=False))
 
     # ── 9. evaluation & metrics ───────────────────────────────────────────────
+    print("\n[9/9] Evaluating performance...")
     metrics = evaluate(
-        df_scores  = df_scores,
-        df_alerts  = alerts,
-        df_events  = df,
-        report_path= "threshold_sweep.csv",
+        df_scores   = df_scores,
+        df_alerts   = alerts,
+        df_events   = df,
+        report_path = "threshold_sweep.csv",
     )
 
-    print(f"  ROC-AUC  : {metrics.get('roc_auc', float('nan')):.4f}")
-    print(f"  PR-AUC   : {metrics.get('pr_auc',  float('nan')):.4f}")
+    print(f"  ROC-AUC : {metrics.get('roc_auc', float('nan')):.4f}")
+    print(f"  PR-AUC  : {metrics.get('pr_auc',  float('nan')):.4f}")
     best = metrics.get("best_f1_threshold", {})
-    print(f"  Best F1  : {best.get('f1', 0):.4f}  "
+    print(f"  Best F1 : {best.get('f1', 0):.4f}  "
           f"@ threshold={best.get('threshold', '?')}"
-          f"  P={best.get('precision',0):.4f}  R={best.get('recall',0):.4f}")
+          f"  P={best.get('precision', 0):.4f}  R={best.get('recall', 0):.4f}")
 
 
 if __name__ == "__main__":

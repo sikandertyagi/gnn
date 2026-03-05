@@ -32,3 +32,15 @@ ALERT_THRESHOLD = 0.6       # score threshold to flag an event
 ALERT_WINDOW    = 300       # seconds: max gap to chain consecutive alerts
 ALERTS_PATH     = "alerts.csv"
 SCORES_PATH     = "anomaly_scores.csv"
+
+# ── large-dataset scaling ─────────────────────────────────────────────────
+# Above this event count the pipeline switches to the disk-backed (memmap)
+# path to avoid loading millions of sequences into RAM simultaneously.
+LARGE_DATASET_THRESHOLD = 200_000
+
+# Sequences written to disk by build_sequences_memmap()
+SEQ_MEMMAP_PATH    = "sequences.dat"
+LABELS_MEMMAP_PATH = "seq_labels.dat"
+
+# Sequences processed per forward pass during inference
+INFER_BATCH_SIZE = 512

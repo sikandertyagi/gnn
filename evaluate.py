@@ -1,24 +1,45 @@
-import torch
+"""
+evaluate.py
+───────────
+Batched reconstruction-error inference.
+
+anomaly_scores(model, X, batch_size)
+  X can be:
+    · np.ndarray  – regular in-memory array
+    · np.memmap   – disk-backed array from sequence_builder
+
+One batch is moved to the model device at a time, so peak RAM is
+O(batch_size × seq_len × feature_dim) regardless of total dataset size.
+"""
+
 import numpy as np
+import torch
 
-def anomaly_scores(model, X):
 
+def anomaly_scores(model, X, batch_size: int = 512) -> np.ndarray:
+    """
+    Parameters
+    ----------
+    model      : TransformerAutoencoder (or any model with forward(x) → x)
+    X          : (N, seq_len, feature_dim) ndarray or memmap
+    batch_size : sequences processed per forward pass
+
+    Returns
+    -------
+    scores : (N,) float32 ndarray  — MSE reconstruction error per sequence
+    """
     device = torch.device("cpu")
-
     model.eval()
 
     scores = []
-
     with torch.no_grad():
-
-        for seq in X:
-
-            x = torch.tensor(seq).float().unsqueeze(0).to(device)
-
+        for start in range(0, len(X), batch_size):
+            # np.array() materialises memmap slices into a contiguous buffer
+            chunk = np.array(X[start : start + batch_size], dtype=np.float32)
+            x     = torch.from_numpy(chunk).to(device)
             recon = model(x)
+            # MSE averaged over time and feature dimensions → one scalar per seq
+            mse   = torch.mean((x - recon) ** 2, dim=(1, 2))
+            scores.append(mse.cpu().numpy())
 
-            loss = torch.mean((x - recon) ** 2).item()
-
-            scores.append(loss)
-
-    return np.array(scores)
+    return np.concatenate(scores).astype(np.float32)
