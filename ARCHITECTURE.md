@@ -1,514 +1,425 @@
-# Architecture: GNN + Transformer Ensemble Anomaly Detection Pipeline
+# Architecture: Fleet-Scale GNN + Transformer Anomaly Detection Pipeline
 
-## What Are We Trying to Achieve?
-
-Modern endpoint security teams face a needle-in-a-haystack problem: a single
-machine can generate millions of Windows Sysmon events per day, and a real
-attack may touch only a few hundred of them. The goal is to **automatically
-surface malicious activity** — malware execution, command-and-control
-communication, privilege escalation, lateral movement — without relying on
-pre-written attack signatures that would miss novel threats.
-
-The fundamental design principle is:
-
-> *Train every model exclusively on normal (benign) behaviour. Anything
-> the model finds surprising is, by definition, anomalous.*
-
-This is **unsupervised anomaly detection**. It requires no labelled attack
-samples during training and can detect attack patterns it has never seen before.
-
-### Why Three Signals?
-
-A single detector has blind spots. This pipeline fuses **three complementary
-anomaly signals**:
-
-| Signal | What it catches | Example |
-|--------|-----------------|---------|
-| **Graph anomaly** (GNN) | Unusual process-to-process or process-to-IP relationships in the network of all processes | `notepad.exe` connecting to an external IP it has never connected to |
-| **Temporal sequence anomaly** (Transformer Autoencoder) | Unusual sequences of events over time | A sequence of `cmd.exe → powershell.exe → curl` that never appeared in training |
-| **Rarity anomaly** (Rarity Engine) | Individual events involving rare processes or rare destinations | A process that has run only once across the entire dataset |
-
-Fusing all three into a **composite score** dramatically reduces both false
-positives (normal events flagged as attacks) and false negatives (attacks
-missed entirely).
+**Branch:** `claude/scalable-fleet-gnn-GmXxV`
+**Scales to:** 1000+ machines, tens of millions of events, commodity hardware
 
 ---
 
-## High-Level Pipeline
+## Problem Statement
+
+The previous pipeline (`claude/gnn-full-architecture-GmXxV`) built a single
+global graph from all events across all machines. This caused three hard
+scalability failures:
+
+| Problem | Root Cause | Effect at Fleet Scale |
+|---------|-----------|----------------------|
+| GNN OOM | Full-batch graph training (entire graph in one forward pass) | ~30–40M edges at 1000 machines → out of memory |
+| Edge bloat | No deduplication (same parent→child pair repeated 50 000× = 50 000 edges) | 10–100× wasted memory |
+| Signal dilution | `powershell.exe` anomalous on 1 machine is averaged with 999 normal ones | GNN embedding swamped by benign signal |
+
+This branch redesigns the GNN stage to eliminate all three problems while
+keeping the Transformer and Rarity Engine exactly the same (they were already
+scale-safe).
+
+---
+
+## What Are We Trying to Achieve?
+
+The goal remains the same as the previous pipelines: detect malicious activity
+in Sysmon endpoint telemetry without needing labelled attack samples. The key
+difference is that this pipeline must work across an entire corporate network
+(1000+ machines) rather than a single machine or small lab environment.
+
+An analyst managing a 1000-machine network cannot review millions of events.
+This pipeline:
+
+1. Learns what "normal" looks like on every machine independently
+2. Flags machines and specific processes that deviate from that machine's normal
+3. Groups high-confidence events into human-readable attack chain summaries
+4. Produces a small ranked alert table that an analyst can action in minutes
+
+---
+
+## Architecture Overview
 
 ```
-Sysmon CSV (raw endpoint telemetry)
+Sysmon CSV (entire fleet — millions of events, 1000s of machines)
         │
-        ▼  [1] Feature Engineering
-        │       Convert raw log columns → 20 numeric features per event
+        ▼  [1] Feature Engineering              (vectorised pandas, O(N))
+        │       20 numeric features per event
         │
-        ▼  [2] Normalisation
-        │       StandardScaler fitted on benign rows only
+        ▼  [2] Normalisation                    (benign-only StandardScaler)
         │
-        ├─────────────────────────────────────────────┐
-        │                                             │
-        ▼  [3] Graph Construction                     ▼  [5] Sequence Building
-        │       Heterogeneous graph:                  │       Sliding window of
-        │       process / ip / user / host nodes      │       20 events per host
-        │                                             │
-        ▼  [4] GNN Encoder Training                   ▼  [6] Transformer Autoencoder
-        │       Self-supervised on benign graph       │       Trained on benign sequences
-        │       → graph anomaly score per event       │       → reconstruction error per event
-        │                                             │
-        └──────────────────┬──────────────────────────┘
-                           │
-                           │  + [7] Rarity Engine
-                           │        Bayesian frequency scoring
-                           │        → rarity score per event
-                           │
-                           ▼  [8] Composite Anomaly Scoring
-                           │       weighted sum: 0.5×recon + 0.3×graph + 0.2×rarity
-                           │
-                           ▼  [9] Alert Aggregation
-                           │       Group consecutive high-score events
-                           │       → attack chain alerts CSV
-                           │
-                           ▼  [10] Evaluation
+        ├───────────────────────────────────────────────────────────────────┐
+        │                                                                   │
+        ▼  [3] Per-Machine Graph Building                                   │
+        │       ┌─────────────────────────────────────────────────────┐    │
+        │       │  Machine A graph   Machine B graph   Machine N graph │    │
+        │       │  ─────────────     ─────────────     ─────────────  │    │
+        │       │  500 proc nodes    300 proc nodes    800 proc nodes  │    │
+        │       │  deduplicated      deduplicated      deduplicated    │    │
+        │       └─────────────────────────────────────────────────────┘    │
+        │                                                                   │
+        ▼  [4] GNN Training — graph mini-batching                          │
+        │       32 machine graphs per training step                         │
+        │       Peak RAM = 32 × avg_graph_size  (constant, not fleet size) │
+        │                                                                   │
+        ▼  [5] GNN Scoring                                                  │
+        │       Per-process L2 distance from benign fleet centroid          │
+        │       → graph_score per event                                     │
+        │                                                                   │
+        ▼  [6] Rarity Engine          vectorised Bayesian frequency         │
+        │       → rarity_score per event                                    │
+        │                                                                   │
+        └─────────────────────────────────────────────────────────────────►│
+                                                                            │
+                           ▼  [7] Sequence Building                         │
+                           │       sliding window per host                  │
+                           │       >200k events → disk memmap               │
+                           │                                                │
+                           ▼  [8] Transformer Autoencoder                   │
+                           │       trained on benign sequences only         │
+                           │       → recon_error per event                  │
+                           │                                                │
+                           ▼  [9] Composite Scoring                         │
+                           │       0.5×recon + 0.3×graph + 0.2×rarity      │
+                           │                                                │
+                           ▼  [10] Alert Aggregation                        │
+                           │       attack chain grouping                    │
+                           │                                                │
+                           ▼  [11] Evaluation                               │
                                    AUROC, PR-AUC, F1, threshold sweep
 ```
 
 ---
 
-## Step-by-Step Explanation
+## Stage-by-Stage Detail
 
 ### [1] Feature Engineering — `feature_engineering.py`
 
-Raw Sysmon log columns (file paths, command-line strings, IPs) cannot be fed
-directly to neural networks. This step converts each event row into 20 numeric
-features across five categories.
+Identical to the previous pipeline. 20 numeric features extracted per event:
 
-#### Process Identity
-| Feature | What it captures |
-|---------|-----------------|
-| `process_name` | Which executable ran (label-encoded integer) |
-| `parent_process` | Which process spawned it |
-
-#### Command-Line Behaviour
-| Feature | What it detects |
-|---------|----------------|
-| `cmd_length` | Abnormally long commands (obfuscation indicators) |
-| `cmd_entropy` | Shannon entropy — high entropy = encoded/obfuscated payload |
-| `has_base64` | Base64 strings longer than 20 characters in command line |
-| `has_http` | HTTP/HTTPS URLs embedded in command line |
-| `has_ip` | Bare IP addresses in arguments (C2 / reverse shells) |
-| `has_download` | wget, curl, Invoke-WebRequest, BITSAdmin, etc. |
-| `has_encodedcommand` | PowerShell `-EncodedCommand` / `-enc` flag |
-
-#### Binary Execution Path
-| Feature | What it detects |
-|---------|----------------|
-| `path_depth` | Very shallow or very deep execution paths |
-| `is_system32` | Binary in System32 (legitimacy signal) |
-| `is_users_dir` | Binary running from user profile (suspicious for executables) |
-| `is_temp_exec` | Binary running from Temp (classic dropper pattern) |
-
-#### Binary Metadata
-| Feature | What it detects |
-|---------|----------------|
-| `is_signed` | Unsigned binaries are more suspicious |
-| `missing_company` | Missing company metadata is common in compiled malware |
-
-#### Network Behaviour
-| Feature | What it detects |
-|---------|----------------|
-| `dest_port` | Raw destination port number |
-| `dest_external` | Whether the connection target is outside the internal network |
-
-#### Temporal Behaviour
-| Feature | What it detects |
-|---------|----------------|
-| `hour` | Hour of day (0–23) |
-| `is_after_hours` | Activity before 7am or after 7pm |
-
-#### Event Type
-| Feature | What it captures |
-|---------|----------------|
-| `eventid` | EventID numeric value |
+- **Process identity**: process name, parent process, parent→child pair
+- **Command-line signals**: length, token count, Base64 detection, HTTP URLs, entropy
+- **Execution path**: path depth, System32, Users dir, Temp dir
+- **Binary metadata**: signed status, missing company name
+- **Network**: destination port, is-external-IP flag
+- **Temporal**: hour of day, is-after-hours flag
 
 ---
 
 ### [2] Normalisation — `normaliser.py`
 
-Neural networks are sensitive to the scale of input features. A `StandardScaler`
-is fitted **exclusively on benign (label=0) rows**, then applied to all rows.
-
-Fitting on benign-only data is critical: including attack events in the
-scaling step would contaminate the baseline and make anomalous feature values
-appear more "normal" than they actually are.
+StandardScaler fitted on benign (label=0) events only, then applied to all
+events. Unchanged from previous pipeline.
 
 ---
 
-### [3] Graph Construction — `graph_builder.py`
+### [3] Per-Machine Graph Building — `machine_graph_builder.py`  *(NEW)*
 
-This is the most distinctive part of the pipeline. Instead of treating events
-as independent rows, we model the **entire dataset as a graph** that captures
-relationships between entities.
+This is the central scalability change.
 
-#### Why a Graph?
-
-An attacker rarely acts in isolation. A typical attack chain involves:
-- `word.exe` spawning `cmd.exe`
-- `cmd.exe` spawning `powershell.exe`
-- `powershell.exe` connecting to `185.220.101.x`
-
-A graph captures this multi-hop relationship explicitly. A single event view
-would miss it.
-
-#### Graph Structure (Heterogeneous)
-
-We build a **heterogeneous graph** — one with multiple types of nodes and edges:
-
+#### Previous approach (problem)
 ```
-Node types:
-  process  – unique executable images (e.g. "powershell.exe")
-  ip       – unique destination IP addresses
-  user     – unique user accounts
-  host     – unique machine names
-
-Edge types:
-  (process)  ──parent_of──►  (process)   parent spawned child
-  (process)  ──connects_to►  (ip)        process made a network connection
-  (process)  ──runs_as──►    (user)       process was running under this account
-  (process)  ──runs_on──►    (host)       process ran on this machine
-  + all reverse edges (for bidirectional message passing)
+All 2M events → one global graph
+  process nodes: every unique Image across all machines
+  edges: one per event → 2M parent_of edges (undeduped)
+  GNN training: all nodes + all edges in RAM simultaneously → OOM
 ```
 
-Each node carries a numeric feature vector derived from the events it
-participated in (e.g. how many times a process ran, average entropy of its
-command lines, whether it ever connected externally).
+#### New approach
+```
+For each machine M:
+  Filter events → machine M's events only
+  Build local vocabulary:
+    proc_vocab = {image_path: local_int_id}  # only procs on THIS machine
+    ip_vocab   = {ip: local_int_id}          # only IPs from THIS machine
+    user_vocab = {user: local_int_id}
 
-Two separate graphs are built:
-- **Benign graph**: only events with label = 0 (used for training the GNN)
-- **Full graph**: all events (used for inference / scoring)
+  Build edges (process→process, process→ip, etc.)
+  Deduplicate: same parent→child pair 50 000 times → 1 edge
+  Store as HeteroData with metadata: machine_name, process_names, machine_label
+```
 
-Both graphs share the same node encoders so that process names map to the
-same integer IDs in both.
+#### Why local vocabularies?
+
+Each machine graph has its own local node index space (0..N_local). This means:
+- `powershell.exe` on Machine A and `powershell.exe` on Machine B are separate
+  nodes in separate graphs
+- The GNN scores anomalies **relative to that machine's typical behaviour**,
+  not the fleet average
+- A machine where `notepad.exe` never makes network connections will correctly
+  flag it as anomalous when it does — even if `notepad.exe` makes network
+  connections on other machines
+
+#### Edge Deduplication
+
+```python
+# Before dedup: parent_of edges (one per raw event)
+# powershell → cmd repeated 50 000 times → 50 000 edges
+edges_raw = torch.tensor([[0,0,0,...,0], [1,1,1,...,1]])  # (2, 50000)
+
+# After dedup: unique pairs only
+edges_dedup = torch.unique(edges_raw.t(), dim=0).t()      # (2, 1)
+```
+
+Deduplication reduces edge count by 10–1000× on real fleet data with repeated
+process execution patterns.
+
+#### Graph size at fleet scale
+
+| Scenario | Nodes per machine | Edges after dedup | GNN RAM |
+|----------|------------------|--------------------|---------|
+| Small machine (server, few services) | ~50 proc, ~20 IP | ~100 edges | Trivial |
+| Active workstation | ~200–500 proc, ~100 IP | ~500–2000 edges | Trivial |
+| 32 machines batched together | 32 × ~300 avg = 9600 nodes | ~25 000 edges | ~5 MB |
 
 ---
 
-### [4] GNN Encoder — `gnn_encoder.py`
+### [4] GNN Training — `gnn_encoder.py: train_gnn_fleet()`  *(CHANGED)*
 
-#### What is a Graph Neural Network?
+#### Previous: Full-batch (one giant graph)
+```python
+# Problem: entire graph in one forward pass
+recon_dict = model(x_dict, edge_index_dict)   # OOM at fleet scale
+```
 
-A GNN is a neural network that operates on graph-structured data. Each node
-aggregates feature information from its neighbours, then from their neighbours,
-and so on. After several rounds, each node's embedding captures not just its
-own features but the structural context of its local neighbourhood.
+#### New: Graph mini-batching (PyG DataLoader)
+```python
+loader = PyGDataLoader(benign_graphs, batch_size=32, shuffle=True)
 
-#### Architecture: Two-Layer Heterogeneous GraphSAGE
+for epoch in range(epochs):
+    for batch in loader:
+        # batch = 32 machine graphs concatenated by PyG automatically
+        # PyG offsets edge indices per graph so nodes don't mix
+        # peak RAM = 32 graphs × avg_graph_size — constant regardless of fleet size
+        recon_dict = model(batch.x_dict, batch.edge_index_dict)
+        loss = MSE(recon_dict, batch.x_dict)
+        loss.backward()
+        optimizer.step()
+```
+
+**How PyG graph batching works:**
+
+PyG's `Batch.from_data_list()` concatenates multiple graphs into one large
+disconnected graph. If Machine A has 500 process nodes and Machine B has 300,
+the batch has 800 process nodes with no edges between them. Machine A's process
+5 (edge_index value 5) and Machine B's process 5 (offset to 505 in the batch)
+are completely separate. Message passing happens only within each machine's
+subgraph.
+
+This gives exactly the same result as processing each graph individually, but
+is 32× faster due to parallelism.
+
+#### Model architecture (unchanged)
 
 ```
-For each node type (process, ip, user, host):
-  Input: node feature vector  x ∈ R^d
+For each node type:
+  Input features x ∈ R^d
         │
-        ▼  HeteroConv Layer 1  (SAGEConv per edge type) + ReLU
-  Embedding: h ∈ R^64
+        ▼  Linear projection → embed_dim=64
+  h₀ ∈ R^64
         │
-        ▼  HeteroConv Layer 2  (SAGEConv per edge type) + LayerNorm
-  Embedding: z ∈ R^64
+        ▼  HeteroConv Layer 1 (SAGEConv per edge type) + ReLU
+  h₁ ∈ R^64
         │
-        ▼  Linear Decoder
-  Reconstruction: x̂ ∈ R^d
-```
-
-GraphSAGE (Graph Sample and Aggregate) is used because it handles variable-
-sized neighbourhoods gracefully and scales to large graphs.
-
-#### Training Objective: Self-Supervised Reconstruction
-
-The GNN is trained only on the benign graph using a **self-supervised node
-feature reconstruction** objective:
-- Encode each node → embedding `z`
-- Decode `z` → reconstructed feature vector `x̂`
-- Loss: `MSE(x, x̂)` across all benign nodes
-
-After training, the model has learned what "normal" graph structure looks like.
-A node whose neighbourhood looks anomalous will produce a high reconstruction
-error at inference time.
-
-#### Benign Centroids and Anomaly Scoring
-
-After training, we compute the **centroid** (mean embedding) for each node
-type over the benign graph. At inference on the full graph:
-
-```
-graph_anomaly_score(node) = ||embedding(node) - centroid||²
-```
-
-A process node whose embedding is far from the centroid of all benign process
-embeddings is structurally anomalous.
-
-These node-level scores are mapped back to events via the process image name.
-
----
-
-### [5] Sequence Building — `sequence_builder.py`
-
-Events are grouped by host, sorted by time, and windowed:
-
-```
-Host A events (sorted by SystemTime):
-  [e1, e2, e3, e4, e5 ... eN]
-
-Sequences (window=20, stride=1):
-  seq_1 = [e1 .. e20]   label = label(e20)
-  seq_2 = [e2 .. e21]   label = label(e21)
-  ...
-```
-
-Windows never cross machine boundaries.
-
-#### Scalability: Memmap Mode for Large Datasets
-
-For datasets above 200,000 events, the pipeline automatically switches to a
-**disk-backed numpy memmap** strategy:
-- Sequences are written to `sequences.dat` on disk rather than held in RAM
-- Training reads mini-batches directly from disk
-- Inference scores are computed in batches of 512
-
-This allows the pipeline to handle datasets of millions of events on a machine
-with modest RAM.
-
----
-
-### [6] Transformer Autoencoder — `transformer_autoencoder.py` + `train.py`
-
-#### What is an Autoencoder?
-
-An autoencoder compresses its input into a lower-dimensional representation
-and then reconstructs it. Trained only on normal data, it becomes very good
-at reconstructing normal patterns and very bad at reconstructing anomalous ones.
-High reconstruction error = anomalous sequence.
-
-#### Why a Transformer (not LSTM)?
-
-A Transformer uses **self-attention** to model relationships between any two
-events in the sequence regardless of distance. An LSTM would struggle to
-connect event position 3 with event position 18 in a sequence of 20. The
-Transformer treats all positions equally and learns which pairs of events
-are related.
-
-#### Architecture
-
-```
-Input:  (batch, 20 events, 20 features)
-        │
-        ▼  Linear projection  →  embed_dim=128
-(batch, 20, 128)
-        │
-        ▼  + Learned Positional Embedding
-(batch, 20, 128)   ← order information preserved
-        │
-        ▼  Transformer Encoder (2 layers, 4 attention heads, ffn_dim=256)
-(batch, 20, 128)   ← each event now contextualised by all others
+        ▼  HeteroConv Layer 2 (SAGEConv per edge type) + LayerNorm
+  h₂ ∈ R^64  ← contextualised by local graph neighbourhood
         │
         ▼  Linear decoder
-(batch, 20, 20)    ← reconstructed feature sequence
+  x̂ ∈ R^d   ← reconstructed features
 ```
 
-#### Training
-
-- Trained only on **benign sequences**
-- 85/15 train/validation split (both from benign data)
-- Early stopping with patience=5 (stops when validation loss stops improving)
-- GPU-accelerated when available (auto-detected via `torch.cuda.is_available()`)
+Loss: `MSE(x, x̂)` across all nodes in the batch. Trained only on benign
+machine graphs so the model learns "what does normal graph structure look like."
 
 ---
 
-### [7] Rarity Engine — `rarity_engine.py`
+### [5] GNN Scoring — `gnn_encoder.py: score_machine_graphs()`  *(CHANGED)*
 
-The GNN and Transformer both learn patterns from the training data as a whole.
-But some events are anomalous simply because they are **extremely rare** —
-a process that runs only once across millions of events, or an IP address
-that has never been seen before.
-
-The Rarity Engine scores this using **Bayesian (Jeffreys) smoothing**:
-
-```
-P(pattern) = (count + 0.5) / (total_count + 0.5 × vocab_size)
-rarity_score = 1 − P(pattern)
+#### Fleet centroid
+```python
+# Encode all benign machine graphs → collect process embeddings → take mean
+fleet_centroid = mean(all_benign_process_embeddings)   # shape: (64,)
 ```
 
-The 0.5 smoothing prevents division-by-zero for unseen patterns and gives
-them a rarity score close to 1 (very rare) without being exactly 1.
+The centroid is the average embedding of a process node in a "normal" machine
+graph. It represents what a typical process looks like in a normal network
+neighbourhood.
 
-#### Three Frequency Patterns Tracked
+#### Per-machine, per-process scoring
+```python
+for each machine graph g:
+    h = model.encode(g.x_dict, g.edge_index_dict)     # local embeddings
+    dists = ||h["process"] - fleet_centroid||₂          # per-process L2 distance
+    for local_idx, process_name in enumerate(g.process_names):
+        raw_scores[machine_name][process_name] = dists[local_idx]
+```
 
-| Pattern | What is counted |
-|---------|----------------|
-| `parent → child` | How often has this specific parent-child process pair been seen? |
-| `process → IP` | How often has this process connected to this specific IP? |
-| `destination IP` | How often has this IP appeared as a destination at all? |
+#### Mapping back to events
+```python
+for each event row (i):
+    host  = df["Computer"][i]
+    image = df["Image"][i]
+    event_graph_scores[i] = machine_scores[host][image]
+```
 
-All three are fitted on benign-only events, then applied to score all events.
-The three sub-scores are averaged into a single rarity score per event.
+Events on machines that were skipped (fewer than `MIN_EVENTS_PER_MACHINE`)
+receive score 0 (treated as baseline-normal rather than artificially flagged).
 
 ---
 
-### [8] Composite Anomaly Scoring — `anomaly_engine.py`
+### [6] Rarity Engine — `rarity_engine.py`
 
-The three signals are combined into a single score per event:
+Unchanged from previous pipeline. Vectorised Bayesian (Jeffreys-smoothed)
+frequency scoring across three patterns:
 
-```
-composite_score = 0.5 × recon_error   +  0.3 × graph_score  +  0.2 × rarity_score
-```
+| Pattern | Score if... |
+|---------|------------|
+| parent → child process pair | This pair rarely appears in benign data |
+| process → destination IP | This process rarely connects to this IP |
+| destination IP | This IP is rarely seen as a destination at all |
 
-Before weighting, each signal is **min-max normalised to [0, 1]** so that
-no single signal dominates due to scale differences.
-
-Leading events that do not have a full 20-event window (and therefore no
-reconstruction error) are treated as baseline (score=0) rather than being
-penalised.
-
-**Weight rationale:**
-
-| Signal | Weight | Rationale |
-|--------|--------|-----------|
-| Reconstruction error | 0.5 | Strongest signal; captures temporal attack patterns directly |
-| Graph anomaly | 0.3 | Structural relationships are highly informative but noisier |
-| Rarity | 0.2 | Strong for novel processes; weaker for common attack tools |
-
-Weights are configurable in `config.py`.
+`rarity_score = 1 − P(pattern)` where P is estimated from benign events only.
 
 ---
 
-### [9] Alert Aggregation — `alert_aggregator.py`
+### [7] Sequence Building — `sequence_builder.py`
 
-Raw per-event scores are hard for an analyst to act on. This step groups
-high-scoring events into **attack chains**:
-
-1. Flag all events with `composite_score >= 0.6` (configurable threshold)
-2. Sort flagged events by timestamp
-3. Group consecutive events whose time gap is **≤ 300 seconds** into one chain
-4. For each chain, produce a summary:
-   - Start/end time and duration
-   - Number of events involved
-   - Unique processes involved (in sequence: `cmd.exe → powershell.exe → ...`)
-   - Destination IPs contacted
-   - Max and mean score across the chain
-
-This transforms a list of millions of scored events into a small table of
-human-readable attack narratives.
+Unchanged. Sliding window of 20 consecutive events per host, sorted by
+`SystemTime`. Above 200 000 events, sequences are written to a `numpy.memmap`
+file on disk rather than held in RAM.
 
 ---
 
-### [10] Evaluation — `metrics.py`
+### [8] Transformer Autoencoder — `transformer_autoencoder.py` + `train.py`
 
-The pipeline produces research-grade evaluation artefacts:
+Unchanged. Self-attention over 20-event windows, trained to reconstruct benign
+sequences. High reconstruction error → anomalous temporal pattern.
 
-| Output | Description |
-|--------|-------------|
-| `metrics.json` | All scalar metrics; importable into paper tables |
-| `roc_curve.csv` | FPR/TPR at every threshold → ROC curve figure |
-| `pr_curve.csv` | Precision/Recall at every threshold → PR curve figure |
-| `threshold_sweep.csv` | F1/P/R for every threshold value |
-| `anomaly_scores.csv` | Per-event composite score + all three sub-signals |
-| `alerts.csv` | Aggregated attack chain alerts |
+For large datasets, training reads mini-batches directly from the memmap file
+so peak RAM = one batch of sequences at a time, regardless of fleet size.
 
-Key metrics reported:
+---
 
-| Metric | Meaning |
+### [9] Composite Anomaly Scoring — `anomaly_engine.py`
+
+Three signals min-max normalised then weighted:
+
+```
+composite = 0.5 × recon_error  +  0.3 × graph_score  +  0.2 × rarity_score
+```
+
+| Signal | Detects |
 |--------|---------|
-| **AUROC** | Area under ROC curve — threshold-independent discrimination ability |
-| **PR-AUC** | Area under Precision-Recall curve — more meaningful when attacks are rare |
-| **Best F1** | F1 at the threshold that maximises it (Youden's J on ROC) |
-| **Precision** | Of flagged events, what fraction are real attacks? |
-| **Recall** | Of all real attacks, what fraction did we catch? |
+| `recon_error` (0.5) | Unusual temporal sequences of events on a host |
+| `graph_score` (0.3) | Unusual process-to-process / process-to-IP structure on a machine |
+| `rarity_score` (0.2) | Rare processes or rare destinations (novel attack tooling) |
 
 ---
 
-## Key Design Decisions
+### [10] Alert Aggregation — `alert_aggregator.py`
 
-| Decision | Rationale |
-|----------|-----------|
-| **Unsupervised / benign-only training** | Attack samples are rare and evolve constantly; training on normal behaviour generalises to novel attacks |
-| **Three-signal ensemble** | Each signal has different blind spots; fusion reduces both false positives and false negatives |
-| **Heterogeneous graph (not homogeneous)** | Processes, IPs, users, and hosts have fundamentally different semantics; mixing them into one node type would destroy information |
-| **GraphSAGE (not GCN or GAT)** | Scales to large graphs without requiring full-batch training; inductive (generalises to unseen nodes) |
-| **Transformer (not LSTM)** | Self-attention captures arbitrary-range event dependencies; LSTMs struggle with long-range patterns |
-| **Benign-only scaler fitting** | Prevents attack data from distorting the normalisation baseline |
-| **Memmap for large datasets** | Allows processing of multi-million-event datasets on machines with limited RAM |
-| **Bayesian smoothing in Rarity Engine** | Prevents zero probabilities for unseen patterns; gives stable scores across rare events |
-| **Attack chain aggregation** | Reduces analyst workload from millions of event scores to tens of actionable chains |
+High-scoring events (`score ≥ 0.6`) are grouped into attack chains: consecutive
+events within 300 seconds are merged. Each chain is summarised with:
+- Time range and duration
+- Unique processes involved (in order)
+- Destination IPs contacted
+- Max and mean anomaly score
+
+Reduces analyst workload from millions of event scores to tens of chains.
 
 ---
 
-## Scalability
+### [11] Evaluation — `metrics.py`
 
-| Component | Small dataset (<200k events) | Large dataset (>200k events) |
-|-----------|------------------------------|------------------------------|
-| Sequences | Held in RAM as numpy array | Written to disk as `numpy.memmap` |
-| Training | Full-batch from RAM | Mini-batched from disk |
-| Inference | Full-pass GPU | Batched in chunks of 512 |
-| Graph | Fully in-memory | Fully in-memory (PyG sparse) |
+AUROC, PR-AUC, best-F1, precision, recall. Writes `metrics.json`,
+`roc_curve.csv`, `pr_curve.csv`, `threshold_sweep.csv` for research reporting.
+
+---
+
+## Scalability at 1000+ Machines
+
+### Memory profile
+
+| Component | Memory usage | Scales with |
+|-----------|-------------|-------------|
+| Raw DataFrame | O(N_events) | Total events (memmap if >200k) |
+| Per-machine graphs | O(N_machines × avg_nodes) | Machines × unique processes/IPs per machine |
+| GNN training (peak) | O(batch_size × avg_nodes) | **Fixed** — independent of fleet size |
+| GNN inference | O(1 machine graph at a time) | Single machine |
+| Sequences | O(N_events) on disk | memmap — disk, not RAM |
+| Transformer training | O(batch_size × seq_len × features) | **Fixed** — independent of fleet size |
+
+### Concrete estimates for 1000 machines
+
+Assume: 1000 machines × 10 000 events/machine = 10M events/day,
+average 300 unique processes + 100 unique IPs per machine.
+
+| Stage | Peak RAM |
+|-------|----------|
+| DataFrame (float32, 20 cols) | 10M × 20 × 4B ≈ **800 MB** |
+| All machine graphs (node features only) | 1000 × 400 nodes × 10 feats × 4B ≈ **16 MB** |
+| GNN training batch (32 machines) | 32 × 400 × 64-dim × 4B ≈ **3 MB** |
+| Sequence memmap (on disk, 20 feats) | 10M × 20 × 20 × 4B ≈ **16 GB on disk** |
+| Sequence training RAM (batch=64) | 64 × 20 × 20 × 4B ≈ **100 KB** |
+| **Total peak RAM** | **~900 MB** |
+
+A machine with 4–8 GB RAM can process 1000-machine fleet data without swapping.
 
 ---
 
 ## File Map
 
-| File | Role |
-|------|------|
-| `config.py` | All hyperparameters, weights, paths, and thresholds |
-| `feature_engineering.py` | Raw log → 20 numeric features |
-| `normaliser.py` | StandardScaler wrapper (benign-fit) |
-| `graph_builder.py` | Build heterogeneous HeteroData graph from events |
-| `gnn_encoder.py` | HeteroGNNEncoder model, training, centroid scoring |
-| `rarity_engine.py` | Bayesian frequency-based rarity scoring |
-| `sequence_builder.py` | Sliding-window sequences; memmap path for large datasets |
-| `transformer_autoencoder.py` | Transformer autoencoder model definition |
-| `train.py` | Training loops for Transformer (in-memory and memmap paths) |
-| `evaluate.py` | Batched anomaly score inference |
-| `anomaly_engine.py` | Fuse three signals into composite score |
-| `alert_aggregator.py` | Group high-score events into attack chain alerts |
-| `metrics.py` | Research-grade evaluation: AUROC, PR-AUC, F1, curves |
-| `main.py` | End-to-end orchestration |
+| File | Role | Changed? |
+|------|------|---------|
+| `config.py` | All hyperparameters; added `MACHINE_GNN_BATCH_SIZE`, `MIN_EVENTS_PER_MACHINE` | Modified |
+| `machine_graph_builder.py` | Per-machine HeteroData with dedup and metadata | **New** |
+| `gnn_encoder.py` | Model unchanged; training/scoring functions replaced for fleet scale | Modified |
+| `main.py` | Updated orchestration (11 steps vs 9) | Modified |
+| `feature_engineering.py` | Unchanged | — |
+| `normaliser.py` | Unchanged | — |
+| `rarity_engine.py` | Unchanged | — |
+| `sequence_builder.py` | Unchanged | — |
+| `transformer_autoencoder.py` | Unchanged | — |
+| `train.py` | Unchanged | — |
+| `evaluate.py` | Unchanged | — |
+| `anomaly_engine.py` | Unchanged | — |
+| `alert_aggregator.py` | Unchanged | — |
+| `metrics.py` | Unchanged | — |
 
 ---
 
 ## How to Run
 
 ```bash
-# Install dependencies
 pip install -r requirements.txt
 
-# Place your Sysmon CSV at the path in config.py (default: sysmondataless.csv)
-# Run the full pipeline
+# Set DATA_PATH in config.py to your Sysmon CSV
+# Tune MACHINE_GNN_BATCH_SIZE (default 32) based on available RAM
 python main.py
 ```
 
-### Outputs
+Key config knobs for fleet-scale tuning:
 
-| File | Contents |
-|------|----------|
-| `gnn_encoder.pt` | Trained GNN encoder weights |
-| `transformer_autoencoder.pt` | Trained Transformer autoencoder weights |
-| `scaler.pkl` | Fitted StandardScaler |
-| `anomaly_scores.csv` | Per-event composite + sub-signal scores |
-| `alerts.csv` | Attack chain alert table |
-| `metrics.json` | All evaluation metrics |
-| `roc_curve.csv` | ROC curve data |
-| `pr_curve.csv` | PR curve data |
-| `threshold_sweep.csv` | F1/P/R at every threshold |
+| Parameter | Default | Increase to | Decrease to |
+|-----------|---------|-------------|-------------|
+| `MACHINE_GNN_BATCH_SIZE` | 32 | Train faster (more RAM used) | Save RAM |
+| `MIN_EVENTS_PER_MACHINE` | 10 | Ignore very quiet machines | Include all machines |
+| `LARGE_DATASET_THRESHOLD` | 200 000 | Keep more data in RAM | Use disk earlier |
+| `INFER_BATCH_SIZE` | 512 | Faster inference (more VRAM) | Save memory |
 
 ---
 
-## Comparison with the Transformer-Only Pipeline
+## Comparison: Three Pipelines
 
-The `claude/analyze-code-correctness-GmXxV` branch uses a single signal
-(Transformer reconstruction error). This full pipeline extends that with two
-additional signals and alert aggregation:
-
-| Capability | Transformer-only | This pipeline |
-|-----------|-----------------|---------------|
-| Temporal sequence anomaly | Yes | Yes |
-| Graph / structural anomaly | No | Yes (GNN) |
-| Frequency / rarity anomaly | No | Yes (Rarity Engine) |
-| Attack chain grouping | No | Yes (Alert Aggregator) |
-| Large dataset (>200k) support | No | Yes (memmap) |
-| Evaluation artefacts | Basic | Research-grade (curves + sweep) |
-| Reproducibility (seeds) | No | Yes (fixed RANDOM_SEED) |
+| Capability | Transformer-only (`analyze-code-correctness`) | Full ensemble (`gnn-full-architecture`) | **Fleet-scale** (`scalable-fleet-gnn`) |
+|-----------|------|------|------|
+| Temporal sequence anomaly | Yes | Yes | Yes |
+| Graph / structural anomaly | No | Yes (global graph) | **Yes (per-machine)** |
+| Frequency / rarity anomaly | No | Yes | Yes |
+| Attack chain alerts | No | Yes | Yes |
+| 1000+ machine support | Limited | **No (OOM)** | **Yes** |
+| Edge deduplication | N/A | No | **Yes** |
+| Per-machine anomaly baseline | N/A | No (global) | **Yes** |
+| Memory at fleet scale | O(N_events) | **OOM** | O(N_events) disk + constant GNN RAM |

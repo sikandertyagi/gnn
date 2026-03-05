@@ -32,6 +32,16 @@ GNN_LR                   = 1e-3
 GNN_MODEL_PATH           = "gnn_encoder.pt"
 GNN_EARLY_STOPPING_PAT   = 5        # patience for GNN training
 
+# ── fleet-scale GNN settings ───────────────────────────────────────────────
+# Number of per-machine graphs processed per GNN training step.
+# Peak RAM for GNN = MACHINE_GNN_BATCH_SIZE × avg_nodes_per_machine × GNN_EMBED_DIM.
+# Increase for faster training on machines with more RAM; decrease to save memory.
+MACHINE_GNN_BATCH_SIZE = 32
+
+# Machines with fewer than this many raw events are skipped during graph
+# building (too few edges for meaningful GNN training/scoring).
+MIN_EVENTS_PER_MACHINE = 10
+
 # ── anomaly scoring weights  (must sum to 1.0) ────────────────────────────
 RECON_WEIGHT  = 0.5         # transformer reconstruction error
 GRAPH_WEIGHT  = 0.3         # GNN graph anomaly score
