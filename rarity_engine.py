@@ -71,14 +71,11 @@ class RarityEngine:
 
         # network destination
         nd = benign["DestinationIp"].dropna().astype(str)
-        self._nd_counts = (
-            nd.value_counts()
-            .reset_index()
-            .rename(columns={"index": "DestinationIp", "DestinationIp": "count"})
-        )
-        # pandas ≥2.0 value_counts() columns are already named correctly
-        if "count" not in self._nd_counts.columns:
-            self._nd_counts.columns = ["DestinationIp", "count"]
+        _vc = nd.value_counts().reset_index()
+        # pandas <2.0 reset_index gives ["index", "DestinationIp"]; ≥2.0 gives ["DestinationIp", "count"]
+        if "index" in _vc.columns:
+            _vc = _vc.rename(columns={"index": "DestinationIp", "DestinationIp": "count"})
+        self._nd_counts = _vc
         self._total_nd = max(int(self._nd_counts["count"].sum()), 1)
         self._vocab_nd = len(self._nd_counts)
 
