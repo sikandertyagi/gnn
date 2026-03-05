@@ -153,7 +153,7 @@ def main():
         gnn_model, full_graph, benign_centroids, encoders["process"]
     )
     proc_enc           = encoders["process"]
-    event_images       = df["Image"].fillna("unknown").values
+    event_images       = df["Image"].fillna("unknown").astype(str).values
     proc_ids           = proc_enc.transform(event_images)
     event_graph_scores = proc_graph_scores[proc_ids].numpy()
     print(f"      mean graph score : {event_graph_scores.mean():.4f}")
