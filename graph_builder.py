@@ -89,18 +89,15 @@ def _process_features(df: pd.DataFrame, enc: LabelEncoder) -> torch.Tensor:
       cmd_length_mean, cmd_entropy_mean, has_base64_rate, has_http_rate,
       is_signed_rate
     """
-    import re
-
     # aggregate per-image statistics from events
+    cmd = df["CommandLine"].fillna("").astype(str)
     agg = (
         df.assign(
             _image=df["Image"].fillna("unknown"),
-            _cmd_len=df["CommandLine"].fillna("").apply(len),
-            _cmd_tok=df["CommandLine"].fillna("").apply(lambda x: len(x.split())),
-            _b64=df["CommandLine"].fillna("").apply(
-                lambda x: int(bool(re.search(r"[A-Za-z0-9+/]{20,}={0,2}", x)))
-            ),
-            _http=df["CommandLine"].fillna("").apply(lambda x: int("http" in x.lower())),
+            _cmd_len=cmd.str.len(),
+            _cmd_tok=cmd.str.split().str.len().fillna(0),
+            _b64=cmd.str.contains(r"[A-Za-z0-9+/]{20,}={0,2}", regex=True, na=False).astype(int),
+            _http=cmd.str.contains("http", case=False, na=False).astype(int),
             _signed=df["Signed"].fillna("false").astype(str).str.lower().eq("true").astype(int),
         )
         .groupby("_image")

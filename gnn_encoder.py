@@ -19,13 +19,15 @@ Training objective (benign-only)
   process node signals structural anomaly.
 """
 
+import copy
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import SAGEConv, HeteroConv
 from torch_geometric.data import HeteroData
 
-from config import GNN_EMBED_DIM, GNN_EPOCHS, GNN_LR
+from config import GNN_EMBED_DIM, GNN_EPOCHS, GNN_LR, GNN_EARLY_STOPPING_PAT
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -110,29 +112,40 @@ class HeteroGNNEncoder(nn.Module):
 # Training
 # ─────────────────────────────────────────────────────────────────────────────
 
-def train_gnn(model: HeteroGNNEncoder, data: HeteroData,
-              epochs: int = GNN_EPOCHS, lr: float = GNN_LR) -> HeteroGNNEncoder:
+def train_gnn(
+    model:    HeteroGNNEncoder,
+    data:     HeteroData,
+    epochs:   int   = GNN_EPOCHS,
+    lr:       float = GNN_LR,
+    patience: int   = GNN_EARLY_STOPPING_PAT,
+) -> HeteroGNNEncoder:
     """
     Train the GNN encoder on *data* (should be built from benign events only)
     using self-supervised node-feature reconstruction.
+
+    Early stopping monitors training loss (GNN training is full-graph, so there
+    is no separate val set; the loss itself is a reliable convergence signal).
     """
     device    = torch.device("cpu")
     model     = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
 
-    x_dict         = {ntype: data[ntype].x.to(device) for ntype in data.node_types}
+    x_dict = {ntype: data[ntype].x.to(device) for ntype in data.node_types}
     edge_index_dict = {
         etype: data[etype].edge_index.to(device)
         for etype in data.edge_types
     }
+
+    best_loss  = float("inf")
+    best_state = copy.deepcopy(model.state_dict())
+    wait       = 0
 
     for epoch in range(1, epochs + 1):
         model.train()
         optimizer.zero_grad()
 
         recon_dict = model(x_dict, edge_index_dict)
-
         loss = sum(
             criterion(recon_dict[ntype], x_dict[ntype])
             for ntype in recon_dict
@@ -140,9 +153,22 @@ def train_gnn(model: HeteroGNNEncoder, data: HeteroData,
         loss.backward()
         optimizer.step()
 
+        loss_val = loss.item()
         if epoch % 5 == 0 or epoch == 1:
-            print(f"  GNN epoch {epoch:>3}/{epochs}  loss={loss.item():.4f}")
+            print(f"  GNN epoch {epoch:>3}/{epochs}  loss={loss_val:.4f}")
 
+        if loss_val < best_loss:
+            best_loss  = loss_val
+            best_state = copy.deepcopy(model.state_dict())
+            wait       = 0
+        else:
+            wait += 1
+            if patience > 0 and wait >= patience:
+                print(f"  GNN early stopping at epoch {epoch}  "
+                      f"(best={best_loss:.4f})")
+                break
+
+    model.load_state_dict(best_state)
     return model
 
 
