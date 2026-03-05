@@ -9,7 +9,7 @@ from sklearn.preprocessing import LabelEncoder
 def _basename(path):
     if pd.isna(path):
         return "unknown"
-    return path.split("\\")[-1].lower()
+    return str(path).split("\\")[-1].lower()
 
 
 def _entropy(s):
