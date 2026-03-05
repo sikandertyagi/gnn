@@ -53,6 +53,16 @@ def aggregate_alerts(
             "processes", "dest_ips", "labels",
         ])
 
+    # Fix #8: drop rows with unparseable/NaN SystemTime before sorting
+    flagged = flagged[flagged["SystemTime"].notna()].copy()
+    if flagged.empty:
+        print(f"  No events with valid SystemTime exceeded threshold {threshold:.2f}")
+        return pd.DataFrame(columns=[
+            "chain_id", "start_time", "end_time", "duration_s",
+            "num_events", "max_score", "mean_score",
+            "processes", "dest_ips", "labels",
+        ])
+
     flagged = flagged.sort_values("SystemTime").reset_index(drop=True)
 
     chains:     list = []

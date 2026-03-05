@@ -10,6 +10,17 @@ Architecture
   Layer 2: HeteroConv( SAGEConv per edge type ) + LayerNorm
   Output : node embedding dict  {node_type: Tensor(N, embed_dim)}
 
+Edge types handled (forward + reverse)
+───────────────────────────────────────
+  (process, parent_of,      process)
+  (process, rev_parent_of,  process)
+  (process, connects_to,    ip)
+  (ip,      rev_connects_to,process)
+  (process, runs_as,        user)
+  (user,    rev_runs_as,    process)
+  (process, runs_on,        host)
+  (host,    rev_runs_on,    process)
+
 Training objective (benign-only)
 ──────────────────────────────────
   Self-supervised node-feature reconstruction:
@@ -36,7 +47,7 @@ from config import GNN_EMBED_DIM, GNN_EPOCHS, GNN_LR, GNN_EARLY_STOPPING_PAT
 
 class HeteroGNNEncoder(nn.Module):
     """
-    Two-layer heterogeneous GraphSAGE encoder.
+    Two-layer heterogeneous GraphSAGE encoder with bidirectional edges.
 
     Parameters
     ----------
@@ -45,10 +56,14 @@ class HeteroGNNEncoder(nn.Module):
     """
 
     _EDGE_TYPES = [
-        ("process", "parent_of",   "process"),
-        ("process", "connects_to", "ip"      ),
-        ("process", "runs_as",     "user"    ),
-        ("process", "runs_on",     "host"    ),
+        ("process", "parent_of",      "process"),
+        ("process", "rev_parent_of",  "process"),
+        ("process", "connects_to",    "ip"      ),
+        ("ip",      "rev_connects_to","process" ),
+        ("process", "runs_as",        "user"    ),
+        ("user",    "rev_runs_as",    "process" ),
+        ("process", "runs_on",        "host"    ),
+        ("host",    "rev_runs_on",    "process" ),
     ]
 
     def __init__(self, node_feature_dims: dict, embed_dim: int = GNN_EMBED_DIM):
@@ -77,14 +92,16 @@ class HeteroGNNEncoder(nn.Module):
     def encode(self, x_dict: dict, edge_index_dict: dict) -> dict:
         h = {ntype: F.relu(self.input_projs[ntype](x)) for ntype, x in x_dict.items()}
 
-        # filter to only edge types present in this graph
+        # filter to only edge types present in this graph (with >0 edges)
         present = {k: v for k, v in edge_index_dict.items() if v.shape[1] > 0}
 
-        h = self.conv1(h, present)
-        h = {ntype: F.relu(feat) for ntype, feat in h.items()}
+        h_new = self.conv1(h, present)
+        # Fix #3: fall back to projected features for node types with no
+        # incoming edges so every type always has an embedding
+        h = {ntype: F.relu(h_new.get(ntype, feat)) for ntype, feat in h.items()}
 
-        h = self.conv2(h, present)
-        h = {ntype: self.norm(feat) for ntype, feat in h.items()}
+        h_new = self.conv2(h, present)
+        h = {ntype: self.norm(h_new.get(ntype, feat)) for ntype, feat in h.items()}
         return h
 
     def decode(self, h_dict: dict) -> dict:
@@ -99,10 +116,16 @@ class HeteroGNNEncoder(nn.Module):
     def _build_conv(self, dim: int) -> HeteroConv:
         return HeteroConv(
             {
-                ("process", "parent_of",   "process"): SAGEConv(dim, dim),
-                ("process", "connects_to", "ip"      ): SAGEConv((dim, dim), dim),
-                ("process", "runs_as",     "user"    ): SAGEConv((dim, dim), dim),
-                ("process", "runs_on",     "host"    ): SAGEConv((dim, dim), dim),
+                # forward edges
+                ("process", "parent_of",      "process"): SAGEConv(dim, dim),
+                ("process", "connects_to",    "ip"      ): SAGEConv((dim, dim), dim),
+                ("process", "runs_as",        "user"    ): SAGEConv((dim, dim), dim),
+                ("process", "runs_on",        "host"    ): SAGEConv((dim, dim), dim),
+                # Fix #3: reverse edges for bidirectional message passing
+                ("process", "rev_parent_of",  "process"): SAGEConv(dim, dim),
+                ("ip",      "rev_connects_to","process" ): SAGEConv((dim, dim), dim),
+                ("user",    "rev_runs_as",    "process" ): SAGEConv((dim, dim), dim),
+                ("host",    "rev_runs_on",    "process" ): SAGEConv((dim, dim), dim),
             },
             aggr="mean",
         )
@@ -151,6 +174,10 @@ def train_gnn(
             for ntype in recon_dict
         )
         loss.backward()
+
+        # Fix #10: gradient clipping to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
         optimizer.step()
 
         loss_val = loss.item()
@@ -168,6 +195,7 @@ def train_gnn(
                       f"(best={best_loss:.4f})")
                 break
 
+    print(f"  GNN training complete  best_loss={best_loss:.4f}")
     model.load_state_dict(best_state)
     return model
 
@@ -220,7 +248,7 @@ def graph_anomaly_scores(model: HeteroGNNEncoder,
     centroid  = benign_centroids["process"].to(device)
     distances = torch.norm(proc_emb - centroid.unsqueeze(0), dim=1)
 
-    # normalise
+    # normalise to [0, 1]
     mn, mx = distances.min(), distances.max()
     scores = (distances - mn) / (mx - mn + 1e-8)
     return scores.cpu()

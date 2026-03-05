@@ -76,6 +76,8 @@ def train_model(
             optimizer.zero_grad()
             loss = criterion(model(x), x)
             loss.backward()
+            # Fix #10: gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             total += loss.item()
         tr_loss = total / len(tr_loader)
@@ -104,6 +106,8 @@ def train_model(
                       f"(best={best_loss:.4f})")
                 break
 
+    # Fix #12: log final training metrics
+    print(f"      Transformer training complete  best_loss={best_loss:.4f}")
     model.load_state_dict(best_state)
     return model
 
@@ -202,6 +206,8 @@ def train_model_large(
             optimizer.zero_grad()
             loss = criterion(model(x), x)
             loss.backward()
+            # Fix #10: gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             total += loss.item()
         tr_loss = total / len(tr_loader)
@@ -227,5 +233,7 @@ def train_model_large(
                       f"(best={best_loss:.4f})")
                 break
 
+    # Fix #12: log final training metrics
+    print(f"      Transformer (large) training complete  best_loss={best_loss:.4f}")
     model.load_state_dict(best_state)
     return model

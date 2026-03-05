@@ -79,6 +79,9 @@ def _set_seeds(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    # Fix #11: deterministic behaviour for reproducibility
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
 
 
 def main():
@@ -113,9 +116,18 @@ def main():
 
     # ── 4. build heterogeneous event graph ────────────────────────────────────
     print("\n[4/9] Building event graph...")
-    df_benign        = df[df["Label"] == TRAIN_LABEL]
-    full_graph,   encoders = build_event_graph(df)
-    benign_graph, _        = build_event_graph(df_benign)
+    df_benign = df[df["Label"] == TRAIN_LABEL]
+
+    # Fix #1: build full_graph first to get shared encoders, then reuse them
+    # for benign_graph so both graphs have identical feature dimensions.
+    full_graph, encoders = build_event_graph(df)
+    benign_graph, _      = build_event_graph(df_benign, encoders=encoders)
+
+    # Fix #5: guard against empty node types
+    for ntype in full_graph.node_types:
+        if full_graph[ntype].x.shape[0] == 0:
+            raise ValueError(f"Empty node type '{ntype}' in full_graph – "
+                             "check that the dataset contains the required columns.")
 
     n_proc   = full_graph["process"].x.shape[0]
     n_ip     = full_graph["ip"].x.shape[0]
@@ -126,7 +138,8 @@ def main():
 
     # ── 5. train GNN encoder (benign graph, early stopping) ───────────────────
     print("\n[5/9] Training GNN encoder on benign graph...")
-    feat_dims = node_feature_dims(benign_graph)
+    # Fix #1: use full_graph's feat_dims so model matches inference graph dims
+    feat_dims = node_feature_dims(full_graph)
     gnn_model = HeteroGNNEncoder(feat_dims)
     gnn_model = train_gnn(gnn_model, benign_graph, epochs=GNN_EPOCHS, lr=GNN_LR)
     torch.save(gnn_model.state_dict(), GNN_MODEL_PATH)
@@ -201,12 +214,14 @@ def main():
         seq_recon_errors = anomaly_scores(ta_model, X, INFER_BATCH_SIZE)
         n_seq_out        = len(X)
 
-    # align sequence-level scores back to events
-    event_recon_errors        = np.empty(n_events, dtype=np.float32)
-    pad                       = n_events - n_seq_out
-    event_recon_errors[:pad]  = seq_recon_errors[0]
-    event_recon_errors[pad:]  = seq_recon_errors
-    print(f"      mean recon error : {event_recon_errors.mean():.4f}")
+    # Fix #4: align sequence-level scores back to events.
+    # Early events (before the first full window) get NaN instead of the
+    # first window's score to avoid artificially inflating their anomaly score.
+    event_recon_errors       = np.full(n_events, np.nan, dtype=np.float32)
+    pad                      = n_events - n_seq_out
+    event_recon_errors[pad:] = seq_recon_errors
+    print(f"      mean recon error : {np.nanmean(event_recon_errors):.4f}  "
+          f"({pad} leading events set to NaN)")
 
     # ── 9. composite scores, alerts, evaluation ────────────────────────────────
     print("\n[9/9] Composite scoring, alerts & evaluation...")

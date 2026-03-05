@@ -105,7 +105,8 @@ class RarityEngine:
             }, index=idx)
             tmp = tmp.merge(self._pc_counts, on=["_parent", "_child"], how="left")
             freq = tmp["count"].fillna(0).values
-            p    = (freq + 1) / (self._total_pc + self._vocab_pc + 1)
+            # Fix #9: Jeffreys (alpha=0.5) smoothing for better stability on small datasets
+            p    = (freq + 0.5) / (self._total_pc + 0.5 * self._vocab_pc)
             scores[:, 0] = np.where(pc_valid.values, 1.0 - p, np.nan)
 
         # ── process-IP rarity ─────────────────────────────────────────────────
@@ -117,7 +118,7 @@ class RarityEngine:
             }, index=idx)
             tmp = tmp.merge(self._pi_counts, on=["_proc", "DestinationIp"], how="left")
             freq = tmp["count"].fillna(0).values
-            p    = (freq + 1) / (self._total_pi + self._vocab_pi + 1)
+            p    = (freq + 0.5) / (self._total_pi + 0.5 * self._vocab_pi)
             scores[:, 1] = np.where(pi_valid.values, 1.0 - p, np.nan)
 
         # ── network-destination rarity ────────────────────────────────────────
@@ -128,7 +129,7 @@ class RarityEngine:
             }, index=idx)
             tmp = tmp.merge(self._nd_counts, on="DestinationIp", how="left")
             freq = tmp["count"].fillna(0).values
-            p    = (freq + 1) / (self._total_nd + self._vocab_nd + 1)
+            p    = (freq + 0.5) / (self._total_nd + 0.5 * self._vocab_nd)
             scores[:, 2] = np.where(nd_valid.values, 1.0 - p, np.nan)
 
         # mean across whichever signals are valid per row; default 0 if none

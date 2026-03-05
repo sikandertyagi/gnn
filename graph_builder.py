@@ -10,12 +10,16 @@ Node types
   host     – unique Computer value
   ip       – unique DestinationIp value
 
-Edge types
+Edge types (forward + reverse for bidirectional message passing)
 ──────────
-  (process, parent_of,  process)  – ParentImage → Image
-  (process, connects_to, ip)      – Image → DestinationIp  (network events)
-  (process, runs_as,    user)     – Image → User
-  (process, runs_on,    host)     – Image → Computer
+  (process, parent_of,      process)  – ParentImage → Image
+  (process, rev_parent_of,  process)  – Image → ParentImage  (reverse)
+  (process, connects_to,    ip)       – Image → DestinationIp  (network events)
+  (ip,      rev_connects_to,process)  – reverse of above
+  (process, runs_as,        user)     – Image → User
+  (user,    rev_runs_as,    process)  – reverse of above
+  (process, runs_on,        host)     – Image → Computer
+  (host,    rev_runs_on,    process)  – reverse of above
 """
 
 import numpy as np
@@ -31,29 +35,53 @@ from feature_engineering import extract_process_name
 # public API
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_event_graph(df: pd.DataFrame):
+def build_event_graph(df: pd.DataFrame, encoders: dict = None):
     """
     Parameters
     ----------
-    df : DataFrame  (full or benign-only; must contain Sysmon columns)
+    df       : DataFrame  (full or benign-only; must contain Sysmon columns)
+    encoders : optional dict of pre-fitted LabelEncoders (from a full-graph
+               call).  When provided the same node vocabulary is reused so
+               that benign_graph and full_graph share identical feature dims.
 
     Returns
     -------
     data     : torch_geometric.data.HeteroData
     encoders : dict[str, LabelEncoder]  – one per node type
     """
-    data     = HeteroData()
-    encoders = _fit_encoders(df)
+    data = HeteroData()
+    if encoders is None:
+        encoders = _fit_encoders(df)
+
+    # guard: every node type must have ≥1 node
+    for ntype, col in [("process", "Image"), ("user", "User"),
+                       ("host", "Computer"), ("ip", "DestinationIp")]:
+        n = len(encoders[ntype].classes_)
+        if n == 0:
+            raise ValueError(
+                f"Empty node type '{ntype}' – column '{col}' has no valid values."
+            )
 
     data["process"].x = _process_features(df, encoders["process"])
     data["user"].x    = _user_features(encoders["user"])
     data["host"].x    = _host_features(encoders["host"])
     data["ip"].x      = _ip_features(df, encoders["ip"])
 
+    # forward edges
     data["process", "parent_of",   "process"].edge_index = _pp_edges(df, encoders["process"])
     data["process", "connects_to", "ip"      ].edge_index = _pi_edges(df, encoders["process"], encoders["ip"])
     data["process", "runs_as",     "user"    ].edge_index = _pu_edges(df, encoders["process"], encoders["user"])
     data["process", "runs_on",     "host"    ].edge_index = _ph_edges(df, encoders["process"], encoders["host"])
+
+    # reverse edges – enable bidirectional message passing
+    data["process", "rev_parent_of",  "process"].edge_index = \
+        data["process", "parent_of",   "process"].edge_index.flip(0)
+    data["ip",   "rev_connects_to", "process"].edge_index = \
+        data["process", "connects_to", "ip"    ].edge_index.flip(0)
+    data["user", "rev_runs_as",     "process"].edge_index = \
+        data["process", "runs_as",     "user"  ].edge_index.flip(0)
+    data["host", "rev_runs_on",     "process"].edge_index = \
+        data["process", "runs_on",     "host"  ].edge_index.flip(0)
 
     return data, encoders
 
@@ -86,11 +114,11 @@ def _fit_encoders(df: pd.DataFrame) -> dict:
 def _process_features(df: pd.DataFrame, enc: LabelEncoder) -> torch.Tensor:
     """
     Features per process node (indexed by enc.classes_):
-      name_hash, path_depth, is_system32, is_users_dir, is_temp_exec,
-      cmd_length_mean, cmd_entropy_mean, has_base64_rate, has_http_rate,
-      is_signed_rate
+      name_hash (normalised), path_depth (normalised), is_system32, is_users_dir,
+      is_temp_exec, cmd_length_mean (log-normalised), cmd_entropy_mean (normalised),
+      has_base64_rate, has_http_rate, is_signed_rate
+    All features are scaled to roughly [0, 1].
     """
-    # aggregate per-image statistics from events
     cmd = df["CommandLine"].fillna("").astype(str)
     agg = (
         df.assign(
@@ -113,11 +141,31 @@ def _process_features(df: pd.DataFrame, enc: LabelEncoder) -> torch.Tensor:
     )
 
     images = pd.Series(enc.classes_)
-    path_depth  = images.apply(lambda x: float(str(x).count("\\")))
-    is_sys32    = images.str.contains("system32", case=False, na=False).astype(float)
-    is_users    = images.str.contains("users",    case=False, na=False).astype(float)
-    is_temp     = images.str.contains("temp",     case=False, na=False).astype(float)
-    name_hash   = images.apply(lambda x: float(hash(extract_process_name(x)) % 10_000))
+
+    # Fix #2: normalize name_hash to [0, 1]  (was raw % 10000 → huge loss)
+    name_hash = images.apply(
+        lambda x: float(hash(extract_process_name(x)) % 10_000) / 10_000.0
+    )
+
+    # Fix #6: normalize continuous features to [0, 1]
+    path_depth = images.apply(lambda x: float(str(x).count("\\")))
+    path_depth = (path_depth / path_depth.clip(lower=1).max()).fillna(0.0)
+
+    is_sys32 = images.str.contains("system32", case=False, na=False).astype(float)
+    is_users = images.str.contains("users",    case=False, na=False).astype(float)
+    is_temp  = images.str.contains("temp",     case=False, na=False).astype(float)
+
+    # log-normalise cmd_length_mean (can be 0–thousands)
+    cmd_len_norm = np.log1p(agg["cmd_length_mean"].values).astype(np.float32)
+    max_len = cmd_len_norm.max()
+    if max_len > 0:
+        cmd_len_norm /= max_len
+
+    # normalise cmd_entropy_mean (token count, typically 0–20)
+    cmd_ent = agg["cmd_entropy_mean"].values.astype(np.float32)
+    max_ent = cmd_ent.max()
+    if max_ent > 0:
+        cmd_ent /= max_ent
 
     feat = np.column_stack([
         name_hash.values,
@@ -125,8 +173,8 @@ def _process_features(df: pd.DataFrame, enc: LabelEncoder) -> torch.Tensor:
         is_sys32.values,
         is_users.values,
         is_temp.values,
-        agg["cmd_length_mean"].values,
-        agg["cmd_entropy_mean"].values,
+        cmd_len_norm,
+        cmd_ent,
         agg["has_base64_rate"].values,
         agg["has_http_rate"].values,
         agg["is_signed_rate"].values,
@@ -137,7 +185,9 @@ def _process_features(df: pd.DataFrame, enc: LabelEncoder) -> torch.Tensor:
 
 def _user_features(enc: LabelEncoder) -> torch.Tensor:
     users = pd.Series(enc.classes_)
-    uid   = np.arange(len(users), dtype=np.float32)
+    n     = len(users)
+    # Fix #6: normalise uid to [0, 1]
+    uid = np.arange(n, dtype=np.float32) / max(n - 1, 1)
     is_admin = users.apply(
         lambda u: float("system" in u.lower() or "admin" in u.lower() or "root" in u.lower())
     ).values.astype(np.float32)
@@ -145,14 +195,15 @@ def _user_features(enc: LabelEncoder) -> torch.Tensor:
 
 
 def _host_features(enc: LabelEncoder) -> torch.Tensor:
+    # Fix #1: fixed dim=1 instead of one-hot (prevents model mismatch when
+    # benign_graph and full_graph have different host counts).
     n = len(enc.classes_)
-    # one-hot: each host is uniquely identified
-    return torch.eye(n, dtype=torch.float32)
+    host_ids = np.arange(n, dtype=np.float32) / max(n - 1, 1)
+    return torch.from_numpy(host_ids.reshape(-1, 1))
 
 
 def _ip_features(df: pd.DataFrame, enc: LabelEncoder) -> torch.Tensor:
     net = df.dropna(subset=["DestinationIp"])
-    # per-IP aggregates
     agg = (
         net.groupby("DestinationIp")
         .agg(
@@ -166,12 +217,15 @@ def _ip_features(df: pd.DataFrame, enc: LabelEncoder) -> torch.Tensor:
         lambda ip: float(not str(ip).startswith(("10.", "192.168.", "172.")))
     ).values.astype(np.float32)
 
-    feat = np.column_stack([
-        agg["port_mean"].values.astype(np.float32),
-        agg["port_max"].values.astype(np.float32),
-        agg["event_count"].values.astype(np.float32),
-        is_external,
-    ])
+    # Fix #6: normalise port and count features to [0, 1]
+    port_mean = agg["port_mean"].values.astype(np.float32) / 65535.0
+    port_max  = agg["port_max"].values.astype(np.float32)  / 65535.0
+    evt_count = np.log1p(agg["event_count"].values.astype(np.float32))
+    max_cnt   = evt_count.max()
+    if max_cnt > 0:
+        evt_count /= max_cnt
+
+    feat = np.column_stack([port_mean, port_max, evt_count, is_external])
     return torch.from_numpy(feat.astype(np.float32))
 
 
@@ -187,9 +241,9 @@ def _pp_edges(df, proc_enc) -> torch.Tensor:
     mask = df["Image"].notna() & df["ParentImage"].notna()
     if not mask.any():
         return torch.zeros((2, 0), dtype=torch.long)
-    sub  = df[mask]
-    src  = proc_enc.transform(sub["ParentImage"].fillna("unknown").astype(str).values)
-    dst  = proc_enc.transform(sub["Image"].fillna("unknown").astype(str).values)
+    sub = df[mask]
+    src = proc_enc.transform(sub["ParentImage"].fillna("unknown").astype(str).values)
+    dst = proc_enc.transform(sub["Image"].fillna("unknown").astype(str).values)
     return _make_edges(src, dst)
 
 
