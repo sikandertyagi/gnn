@@ -57,6 +57,7 @@ from train import train_model
 from evaluate import anomaly_scores
 from anomaly_engine import compute_anomaly_scores
 from alert_aggregator import aggregate_alerts
+from metrics import evaluate
 
 
 def main():
@@ -175,6 +176,21 @@ def main():
         print(alerts.nlargest(5, "max_score")[
             ["chain_id", "num_events", "max_score", "processes", "dest_ips"]
         ].to_string(index=False))
+
+    # ── 9. evaluation & metrics ───────────────────────────────────────────────
+    metrics = evaluate(
+        df_scores  = df_scores,
+        df_alerts  = alerts,
+        df_events  = df,
+        report_path= "threshold_sweep.csv",
+    )
+
+    print(f"  ROC-AUC  : {metrics.get('roc_auc', float('nan')):.4f}")
+    print(f"  PR-AUC   : {metrics.get('pr_auc',  float('nan')):.4f}")
+    best = metrics.get("best_f1_threshold", {})
+    print(f"  Best F1  : {best.get('f1', 0):.4f}  "
+          f"@ threshold={best.get('threshold', '?')}"
+          f"  P={best.get('precision',0):.4f}  R={best.get('recall',0):.4f}")
 
 
 if __name__ == "__main__":
