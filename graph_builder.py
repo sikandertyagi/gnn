@@ -70,13 +70,14 @@ def node_feature_dims(data: HeteroData) -> dict:
 def _fit_encoders(df: pd.DataFrame) -> dict:
     all_images = (
         pd.concat([df["Image"].fillna("unknown"), df["ParentImage"].fillna("unknown")])
+        .astype(str)
         .unique()
     )
     proc_enc = LabelEncoder().fit(all_images)
-    user_enc = LabelEncoder().fit(df["User"].fillna("unknown").unique())
-    host_enc = LabelEncoder().fit(df["Computer"].fillna("unknown").unique())
+    user_enc = LabelEncoder().fit(df["User"].fillna("unknown").astype(str).unique())
+    host_enc = LabelEncoder().fit(df["Computer"].fillna("unknown").astype(str).unique())
 
-    net_ips = df["DestinationIp"].dropna().unique()
+    net_ips = df["DestinationIp"].dropna().astype(str).unique()
     ip_enc  = LabelEncoder().fit(net_ips if len(net_ips) else ["0.0.0.0"])
 
     return {"process": proc_enc, "user": user_enc, "host": host_enc, "ip": ip_enc}
@@ -93,7 +94,7 @@ def _process_features(df: pd.DataFrame, enc: LabelEncoder) -> torch.Tensor:
     cmd = df["CommandLine"].fillna("").astype(str)
     agg = (
         df.assign(
-            _image=df["Image"].fillna("unknown"),
+            _image=df["Image"].fillna("unknown").astype(str),
             _cmd_len=cmd.str.len(),
             _cmd_tok=cmd.str.split().str.len().fillna(0),
             _b64=cmd.str.contains(r"[A-Za-z0-9+/]{20,}={0,2}", regex=True, na=False).astype(int),
@@ -187,8 +188,8 @@ def _pp_edges(df, proc_enc) -> torch.Tensor:
     if not mask.any():
         return torch.zeros((2, 0), dtype=torch.long)
     sub  = df[mask]
-    src  = proc_enc.transform(sub["ParentImage"].fillna("unknown").values)
-    dst  = proc_enc.transform(sub["Image"].fillna("unknown").values)
+    src  = proc_enc.transform(sub["ParentImage"].fillna("unknown").astype(str).values)
+    dst  = proc_enc.transform(sub["Image"].fillna("unknown").astype(str).values)
     return _make_edges(src, dst)
 
 
@@ -197,8 +198,8 @@ def _pi_edges(df, proc_enc, ip_enc) -> torch.Tensor:
     if not mask.any():
         return torch.zeros((2, 0), dtype=torch.long)
     sub = df[mask]
-    src = proc_enc.transform(sub["Image"].fillna("unknown").values)
-    dst = ip_enc.transform(sub["DestinationIp"].values)
+    src = proc_enc.transform(sub["Image"].fillna("unknown").astype(str).values)
+    dst = ip_enc.transform(sub["DestinationIp"].astype(str).values)
     return _make_edges(src, dst)
 
 
@@ -207,8 +208,8 @@ def _pu_edges(df, proc_enc, user_enc) -> torch.Tensor:
     if not mask.any():
         return torch.zeros((2, 0), dtype=torch.long)
     sub = df[mask]
-    src = proc_enc.transform(sub["Image"].fillna("unknown").values)
-    dst = user_enc.transform(sub["User"].fillna("unknown").values)
+    src = proc_enc.transform(sub["Image"].fillna("unknown").astype(str).values)
+    dst = user_enc.transform(sub["User"].fillna("unknown").astype(str).values)
     return _make_edges(src, dst)
 
 
@@ -217,6 +218,6 @@ def _ph_edges(df, proc_enc, host_enc) -> torch.Tensor:
     if not mask.any():
         return torch.zeros((2, 0), dtype=torch.long)
     sub = df[mask]
-    src = proc_enc.transform(sub["Image"].fillna("unknown").values)
-    dst = host_enc.transform(sub["Computer"].fillna("unknown").values)
+    src = proc_enc.transform(sub["Image"].fillna("unknown").astype(str).values)
+    dst = host_enc.transform(sub["Computer"].fillna("unknown").astype(str).values)
     return _make_edges(src, dst)
