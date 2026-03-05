@@ -4,7 +4,7 @@ import numpy as np
 
 def train_model(model, X_train, epochs, batch_size, lr):
 
-    device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = model.to(device)
 

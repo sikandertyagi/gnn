@@ -3,7 +3,7 @@ import numpy as np
 
 def anomaly_scores(model, X):
 
-    device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model.eval()
 
