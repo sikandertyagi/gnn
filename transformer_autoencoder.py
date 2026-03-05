@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import math
 
 class TransformerAutoencoder(nn.Module):
 
@@ -8,6 +9,9 @@ class TransformerAutoencoder(nn.Module):
         super().__init__()
 
         self.input_proj = nn.Linear(feature_dim, embed_dim)
+
+        # Positional encoding so the model can distinguish event order in a sequence
+        self.pos_embedding = nn.Embedding(512, embed_dim)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
@@ -23,6 +27,11 @@ class TransformerAutoencoder(nn.Module):
     def forward(self, x):
 
         x = self.input_proj(x)
+
+        # Add positional embeddings so temporal order is captured
+        seq_len = x.size(1)
+        positions = torch.arange(seq_len, device=x.device).unsqueeze(0)
+        x = x + self.pos_embedding(positions)
 
         z = self.encoder(x)
 

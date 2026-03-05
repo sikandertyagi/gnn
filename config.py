@@ -14,5 +14,3 @@ NUM_LAYERS = 2
 FF_DIM = 256
 
 MODEL_PATH = "transformer_autoencoder.pt"
-
-FEATURE_COLUMNS = []

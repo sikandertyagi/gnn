@@ -16,7 +16,7 @@ def build_sequences(df, feature_cols, seq_len):
         values = host_df[feature_cols].values
         lab = host_df["Label"].values
 
-        for i in range(len(values) - seq_len):
+        for i in range(len(values) - seq_len + 1):
 
             seq = values[i:i+seq_len]
 

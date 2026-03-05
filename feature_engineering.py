@@ -77,7 +77,7 @@ def feature_engineering(df):
 
     df["dest_port"] = df["DestinationPort"].fillna(0)
 
-    df["dest_external"] = ~df["DestinationIp"].fillna("").str.startswith(("10.","192.168","172.")).astype(int)
+    df["dest_external"] = (~df["DestinationIp"].fillna("").str.startswith(("10.","192.168","172."))).astype(int)
 
     # ---------------------------
     # temporal features
