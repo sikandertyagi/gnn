@@ -13,4 +13,7 @@ NUM_HEADS = 4
 NUM_LAYERS = 2
 FF_DIM = 256
 
+VAL_RATIO = 0.2
+
 MODEL_PATH = "transformer_autoencoder.pt"
+SCALER_PATH = "scaler.pkl"
