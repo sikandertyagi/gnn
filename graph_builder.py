@@ -22,6 +22,9 @@ Edge types (forward + reverse for bidirectional message passing)
   (host,    rev_runs_on,    process)  – reverse of above
 """
 
+import re
+import zlib
+
 import numpy as np
 import pandas as pd
 import torch
@@ -29,6 +32,9 @@ from torch_geometric.data import HeteroData
 from sklearn.preprocessing import LabelEncoder
 
 from feature_engineering import extract_process_name
+
+# RFC 1918 + loopback pattern (same as feature_engineering.py)
+_RFC1918 = re.compile(r"^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|127\.)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -132,7 +138,7 @@ def _process_features(df: pd.DataFrame, enc: LabelEncoder) -> torch.Tensor:
         .groupby("_image")
         .agg(
             cmd_length_mean=("_cmd_len", "mean"),
-            cmd_entropy_mean=("_cmd_tok", "mean"),
+            cmd_token_mean=("_cmd_tok", "mean"),
             has_base64_rate=("_b64", "mean"),
             has_http_rate=("_http", "mean"),
             is_signed_rate=("_signed", "mean"),
@@ -142,9 +148,9 @@ def _process_features(df: pd.DataFrame, enc: LabelEncoder) -> torch.Tensor:
 
     images = pd.Series(enc.classes_)
 
-    # Fix #2: normalize name_hash to [0, 1]  (was raw % 10000 → huge loss)
+    # CRC32-based name_hash: deterministic, stable across runs, always in [0, 1]
     name_hash = images.apply(
-        lambda x: float(hash(extract_process_name(x)) % 10_000) / 10_000.0
+        lambda x: (zlib.crc32(extract_process_name(x).encode("utf-8")) & 0xFFFFFFFF) / 0xFFFFFFFF
     )
 
     # Fix #6: normalize continuous features to [0, 1]
@@ -161,8 +167,8 @@ def _process_features(df: pd.DataFrame, enc: LabelEncoder) -> torch.Tensor:
     if max_len > 0:
         cmd_len_norm /= max_len
 
-    # normalise cmd_entropy_mean (token count, typically 0–20)
-    cmd_ent = agg["cmd_entropy_mean"].values.astype(np.float32)
+    # normalise cmd_token_mean (token count, typically 0–20)
+    cmd_ent = agg["cmd_token_mean"].values.astype(np.float32)
     max_ent = cmd_ent.max()
     if max_ent > 0:
         cmd_ent /= max_ent
@@ -214,7 +220,7 @@ def _ip_features(df: pd.DataFrame, enc: LabelEncoder) -> torch.Tensor:
         .reindex(enc.classes_, fill_value=0.0)
     )
     is_external = pd.Series(enc.classes_).apply(
-        lambda ip: float(not str(ip).startswith(("10.", "192.168.", "172.")))
+        lambda ip: float(not (_RFC1918.match(str(ip)) or str(ip) == ""))
     ).values.astype(np.float32)
 
     # Fix #6: normalise port and count features to [0, 1]
@@ -234,7 +240,10 @@ def _ip_features(df: pd.DataFrame, enc: LabelEncoder) -> torch.Tensor:
 def _make_edges(src_ids, dst_ids) -> torch.Tensor:
     if len(src_ids) == 0:
         return torch.zeros((2, 0), dtype=torch.long)
-    return torch.tensor(np.stack([src_ids, dst_ids]), dtype=torch.long)
+    edge = torch.tensor(np.stack([src_ids, dst_ids]), dtype=torch.long)
+    # deduplicate parallel edges (same src → same dst seen multiple times)
+    unique = torch.unique(edge.t(), dim=0)
+    return unique.t().contiguous()
 
 
 def _pp_edges(df, proc_enc) -> torch.Tensor:

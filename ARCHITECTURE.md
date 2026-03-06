@@ -82,11 +82,35 @@ Raw Sysmon log columns (file paths, command-line strings, IPs) cannot be fed
 directly to neural networks. This step converts each event row into 20 numeric
 features across five categories.
 
+#### Categorical Encoding: Deterministic CRC32 Hashing
+
+The five categorical columns (`process_name`, `parent_process`, `parent_child`,
+`User`, `IntegrityLevel`) are encoded using **CRC32 hashing** instead of
+`sklearn.LabelEncoder`:
+
+```python
+hash_value = (zlib.crc32(s.encode("utf-8")) & 0xFFFFFFFF) / 0xFFFFFFFF
+```
+
+This is stable across runs (no `PYTHONHASHSEED` dependency), requires no
+fit/transform step, always produces values in [0, 1], and handles unseen
+categories at inference without error.  These hashed columns come first in
+`feature_cols` and are skipped by the StandardScaler (they are already in
+[0, 1]; z-scoring them is semantically meaningless).
+
+#### Bug Fixes in Feature Engineering
+
+- **`dest_external`**: The original code applied bitwise `~` to an int Series,
+  yielding -1/-2.  Fixed by inverting the bool Series before `.astype(int)`.
+- **RFC 1918 detection**: `172.*` was too broad (captured public addresses).
+  The correct 172.16.0.0/12 range is now matched with:
+  `re.compile(r"^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|127\.)")`
+
 #### Process Identity
 | Feature | What it captures |
 |---------|-----------------|
-| `process_name` | Which executable ran (label-encoded integer) |
-| `parent_process` | Which process spawned it |
+| `process_name` | Which executable ran (CRC32 hash, in [0, 1]) |
+| `parent_process` | Which process spawned it (CRC32 hash) |
 
 #### Command-Line Behaviour
 | Feature | What it detects |
@@ -141,6 +165,11 @@ Fitting on benign-only data is critical: including attack events in the
 scaling step would contaminate the baseline and make anomalous feature values
 appear more "normal" than they actually are.
 
+The scaler is applied **only to the numeric columns** (skipping the first
+`N_CATEGORICAL_FEATURES = 5` CRC32-hashed columns, which are already in
+[0, 1]).  Z-scoring hash values is semantically meaningless and would destroy
+the uniform distribution they are designed to produce.
+
 ---
 
 ### [3] Graph Construction — `graph_builder.py`
@@ -179,8 +208,8 @@ Edge types:
 ```
 
 Each node carries a numeric feature vector derived from the events it
-participated in (e.g. how many times a process ran, average entropy of its
-command lines, whether it ever connected externally).
+participated in (e.g. how many times a process ran, average token count of
+its command lines, whether it ever connected externally).
 
 Two separate graphs are built:
 - **Benign graph**: only events with label = 0 (used for training the GNN)
@@ -188,6 +217,20 @@ Two separate graphs are built:
 
 Both graphs share the same node encoders so that process names map to the
 same integer IDs in both.
+
+#### Bug Fixes in Graph Construction
+
+- **Deterministic `name_hash`**: The original `hash()` call used Python's
+  session-randomised hash seed.  Replaced with CRC32, identical to
+  `feature_engineering.py`, producing stable values in [0, 1].
+- **`cmd_token_mean` rename**: The per-process aggregation field was named
+  `cmd_entropy_mean` but actually aggregated `_cmd_tok` (token count, not
+  Shannon entropy).  Renamed to `cmd_token_mean` for clarity.
+- **Edge deduplication**: Multiple events between the same process pair
+  created parallel edges.  Removed with `torch.unique(edge.t(), dim=0)`.
+- **RFC 1918 `is_external` fix**: `startswith("172.")` captured public IPs
+  in the 172.0–172.15 and 172.32–172.255 ranges.  Replaced with the same
+  `_RFC1918` regex pattern used in `feature_engineering.py`.
 
 ---
 
@@ -231,17 +274,22 @@ After training, the model has learned what "normal" graph structure looks like.
 A node whose neighbourhood looks anomalous will produce a high reconstruction
 error at inference time.
 
-#### Benign Centroids and Anomaly Scoring
+#### Inference: Benign Features + Full Graph Topology
 
-After training, we compute the **centroid** (mean embedding) for each node
-type over the benign graph. At inference on the full graph:
+At inference, the GNN receives:
+- **Node features** from the **benign graph** (not the full graph)
+- **Edge topology** from the **full graph**
 
-```
-graph_anomaly_score(node) = ||embedding(node) - centroid||²
-```
+This separation is critical.  If node features were aggregated from all events
+(including attacks), attack statistics (e.g. very long command lines) would
+leak into the feature vectors, making the reconstruction error noisy and
+uncorrelated with actual anomalies.  By using benign-only features, attack
+processes that only appear in attack events will have zero-filled feature
+vectors (via `reindex(fill_value=0.0)`), making them structurally distinctive.
 
-A process node whose embedding is far from the centroid of all benign process
-embeddings is structurally anomalous.
+The **edge topology** from the full graph is kept because attack-introduced
+relationships (new parent-child process chains, novel IP connections) are the
+primary structural signal.
 
 These node-level scores are mapped back to events via the process image name.
 
@@ -259,9 +307,12 @@ Sequences (window=20, stride=1):
   seq_1 = [e1 .. e20]   label = label(e20)
   seq_2 = [e2 .. e21]   label = label(e21)
   ...
+  seq_{N-19} = [e_{N-19} .. eN]
 ```
 
 Windows never cross machine boundaries.
+
+**Off-by-one fix**: `numpy.lib.stride_tricks.sliding_window_view(values, seq_len, axis=0)` on an array of length `M` produces exactly `M - seq_len + 1` windows (not `M - seq_len`).  The original code discarded the last valid window.  Both the in-memory and memmap paths are corrected.
 
 #### Scalability: Memmap Mode for Large Datasets
 
@@ -301,22 +352,42 @@ Input:  (batch, 20 events, 20 features)
         ▼  Linear projection  →  embed_dim=128
 (batch, 20, 128)
         │
-        ▼  + Learned Positional Embedding
-(batch, 20, 128)   ← order information preserved
+        ▼  + Sinusoidal Positional Encoding (fixed, from Vaswani et al. 2017)
+(batch, 20, 128)   ← order information preserved without learned parameters
         │
         ▼  Transformer Encoder (2 layers, 4 attention heads, ffn_dim=256)
-(batch, 20, 128)   ← each event now contextualised by all others
+(batch, 20, 128)   ← each event contextualised by all others
         │
-        ▼  Linear decoder
+        ▼  Mean-pool + bottleneck Linear  →  embed_dim//4 = 32
+(batch, 32)        ← compressed representation; forces meaningful compression
+        │
+        ▼  Expand Linear  →  embed_dim=128  (broadcast over T time steps)
+(batch, 20, 128)
+        │
+        ▼  Transformer Decoder (cross-attention on encoder memory)
+(batch, 20, 128)   ← each position attends to full encoder context
+        │
+        ▼  Linear projection
 (batch, 20, 20)    ← reconstructed feature sequence
 ```
 
+**Architecture improvements:**
+- **Sinusoidal PE** (fixed, not learned): stable on short sequences; prevents
+  over-fitting of position embeddings on small datasets.
+- **True TransformerDecoder with cross-attention**: each decoded position
+  attends to the full encoder memory, giving a richer reconstruction signal
+  than a second encoder (which has no cross-attention).
+- **Compressed bottleneck** (embed_dim → embed_dim//4): forces the model to
+  learn a compact representation of normal behaviour; prevents the trivial
+  identity shortcut.
+
 #### Training
 
-- Trained only on **benign sequences**
-- 85/15 train/validation split (both from benign data)
-- Early stopping with patience=5 (stops when validation loss stops improving)
-- GPU-accelerated when available (auto-detected via `torch.cuda.is_available()`)
+- **AdamW** (`weight_decay=1e-4`) for transformer weight regularisation.
+- **LR schedule**: 10% linear warmup then cosine annealing to zero (per-batch).
+- **Gradient clipping** (`max_norm=1.0`) to prevent exploding gradients.
+- 85/15 train/validation split from benign data.
+- Early stopping with patience=5.
 
 ---
 
@@ -358,8 +429,10 @@ The three signals are combined into a single score per event:
 composite_score = 0.5 × recon_error   +  0.3 × graph_score  +  0.2 × rarity_score
 ```
 
-Before weighting, each signal is **min-max normalised to [0, 1]** so that
-no single signal dominates due to scale differences.
+Before weighting, each signal is **min-max normalised** using the range
+observed on **benign events only**.  This prevents attack scores from
+compressing the normalised range and making themselves appear less anomalous
+(test-set leakage via the normalisation step).
 
 Leading events that do not have a full 20-event window (and therefore no
 reconstruction error) are treated as baseline (score=0) rather than being
@@ -383,9 +456,11 @@ Raw per-event scores are hard for an analyst to act on. This step groups
 high-scoring events into **attack chains**:
 
 1. Flag all events with `composite_score >= 0.6` (configurable threshold)
-2. Sort flagged events by timestamp
-3. Group consecutive events whose time gap is **≤ 300 seconds** into one chain
-4. For each chain, produce a summary:
+2. **Group by host** (`Computer` column) so events from different machines
+   are never merged into the same chain
+3. Within each host, sort flagged events by timestamp
+4. Group consecutive events whose time gap is **≤ 300 seconds** into one chain
+5. For each chain, produce a summary:
    - Start/end time and duration
    - Number of events involved
    - Unique processes involved (in sequence: `cmd.exe → powershell.exe → ...`)
@@ -431,7 +506,14 @@ Key metrics reported:
 | **Heterogeneous graph (not homogeneous)** | Processes, IPs, users, and hosts have fundamentally different semantics; mixing them into one node type would destroy information |
 | **GraphSAGE (not GCN or GAT)** | Scales to large graphs without requiring full-batch training; inductive (generalises to unseen nodes) |
 | **Transformer (not LSTM)** | Self-attention captures arbitrary-range event dependencies; LSTMs struggle with long-range patterns |
+| **Sinusoidal PE (not learned)** | Fixed encoding is stable on short sequences and requires no extra parameters |
+| **TransformerDecoder (not second encoder)** | Cross-attention on encoder memory produces richer reconstruction signal |
+| **Compressed bottleneck (embed_dim//4)** | Forces meaningful compression; prevents identity shortcut that would make all sequences easy to reconstruct |
+| **CRC32 categorical hashing** | Deterministic and stable across runs; no fit/transform mismatch at inference |
 | **Benign-only scaler fitting** | Prevents attack data from distorting the normalisation baseline |
+| **Benign-only normalisation in anomaly engine** | Prevents attack score ranges from compressing the composite score and hiding anomalies |
+| **Benign features + full topology for GNN inference** | Avoids contaminated node features while preserving structural attack signals in edge topology |
+| **Host-scoped alert chains** | Prevents events from different machines being merged into a single chain |
 | **Memmap for large datasets** | Allows processing of multi-million-event datasets on machines with limited RAM |
 | **Bayesian smoothing in Rarity Engine** | Prevents zero probabilities for unseen patterns; gives stable scores across rare events |
 | **Attack chain aggregation** | Reduces analyst workload from millions of event scores to tens of actionable chains |

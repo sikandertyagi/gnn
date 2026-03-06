@@ -19,6 +19,7 @@ Both functions
 """
 
 import copy
+import math
 
 import numpy as np
 import torch
@@ -26,6 +27,24 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset, Dataset
 
 from config import RANDOM_SEED
+
+
+def _build_scheduler(optimizer, n_epochs: int, n_batches: int,
+                     warmup_fraction: float = 0.1):
+    """
+    Linear warmup (warmup_fraction of total steps) followed by cosine
+    annealing to zero.  Returned scheduler is stepped once per batch.
+    """
+    total_steps  = n_epochs * n_batches
+    warmup_steps = max(1, int(total_steps * warmup_fraction))
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return step / warmup_steps
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 # ── in-memory training ────────────────────────────────────────────────────────
@@ -60,7 +79,8 @@ def train_model(
     tr_loader = DataLoader(tr_ds, batch_size=batch_size, shuffle=True,
                            num_workers=0, pin_memory=False,
                            generator=torch.Generator().manual_seed(RANDOM_SEED))
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = _build_scheduler(optimizer, epochs, len(tr_loader))
     criterion = nn.MSELoss()
 
     best_loss  = float("inf")
@@ -79,6 +99,7 @@ def train_model(
             # Fix #10: gradient clipping to prevent exploding gradients
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+            scheduler.step()
             total += loss.item()
         tr_loss = total / len(tr_loader)
 
@@ -180,7 +201,8 @@ def train_model_large(
     tr_loader = DataLoader(tr_ds, batch_size=batch_size, shuffle=True,
                            num_workers=0, pin_memory=False,
                            generator=torch.Generator().manual_seed(RANDOM_SEED))
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = _build_scheduler(optimizer, epochs, len(tr_loader))
     criterion = nn.MSELoss()
 
     vl_loader = None
@@ -209,6 +231,7 @@ def train_model_large(
             # Fix #10: gradient clipping to prevent exploding gradients
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+            scheduler.step()
             total += loss.item()
         tr_loss = total / len(tr_loader)
 

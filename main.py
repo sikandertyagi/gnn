@@ -151,7 +151,7 @@ def main():
     # ── 6. per-event graph anomaly scores ─────────────────────────────────────
     print("\n[6/9] Computing graph anomaly scores...")
     proc_graph_scores = graph_anomaly_scores(
-        gnn_model, full_graph, encoders["process"]
+        gnn_model, full_graph, benign_graph, encoders["process"]
     )
     proc_enc           = encoders["process"]
     event_images       = df["Image"].fillna("unknown").astype(str).values
@@ -256,6 +256,7 @@ def main():
         event_recon_errors,
         event_graph_scores,
         event_rarity_scores,
+        df["Label"].values,
     )
 
     df_scores = pd.DataFrame({

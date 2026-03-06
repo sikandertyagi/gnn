@@ -42,13 +42,13 @@ def build_sequences(df: pd.DataFrame, feature_cols: list, seq_len: int):
         values  = host_df[feature_cols].values.astype(np.float32)
         labs    = host_df["Label"].values
 
-        n = len(values) - seq_len
+        n = len(values) - seq_len + 1  # sliding_window_view yields exactly M-seq_len+1 windows
         if n <= 0:
             continue
 
         # stride-trick view: no copy until np.array() call below
         windows = np.lib.stride_tricks.sliding_window_view(values, seq_len, axis=0)
-        # shape: (n+1, n_features, seq_len) → take first n, transpose
+        # shape: (n, n_features, seq_len) → transpose to (n, seq_len, n_features)
         sequences.append(windows[:n].transpose(0, 2, 1).copy())
         labels.append(labs[seq_len - 1 : seq_len - 1 + n])
 
@@ -83,7 +83,7 @@ def build_sequences_memmap(
     n_sequences = 0
     for host in hosts:
         host_len = int((df["Computer"] == host).sum())
-        n_sequences += max(0, host_len - seq_len)
+        n_sequences += max(0, host_len - seq_len + 1)
 
     if n_sequences == 0:
         return 0, (0, seq_len, n_features)
@@ -101,13 +101,13 @@ def build_sequences_memmap(
         values  = host_df[feature_cols].values.astype(np.float32)  # (M, F)
         labs    = host_df["Label"].values.astype(np.int32)
 
-        n = len(values) - seq_len
+        n = len(values) - seq_len + 1  # sliding_window_view yields exactly M-seq_len+1 windows
         if n <= 0:
             continue
 
         # stride-trick view — no RAM copy until the assignment to seq_mm
         windows = np.lib.stride_tricks.sliding_window_view(values, seq_len, axis=0)
-        # shape: (n+1, n_features, seq_len) → (n, seq_len, n_features)
+        # shape: (n, n_features, seq_len) → (n, seq_len, n_features)
         seq_mm[offset : offset + n] = windows[:n].transpose(0, 2, 1)
         lbl_mm[offset : offset + n] = labs[seq_len - 1 : seq_len - 1 + n]
 

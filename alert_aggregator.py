@@ -36,7 +36,7 @@ def aggregate_alerts(
     Returns
     -------
     DataFrame of alert chains with columns:
-        chain_id, start_time, end_time, duration_s, num_events,
+        chain_id, host, start_time, end_time, duration_s, num_events,
         max_score, mean_score, processes, dest_ips, labels
     """
     result            = df.copy().reset_index(drop=True)
@@ -48,7 +48,7 @@ def aggregate_alerts(
     if flagged.empty:
         print(f"  No events exceeded threshold {threshold:.2f}")
         return pd.DataFrame(columns=[
-            "chain_id", "start_time", "end_time", "duration_s",
+            "chain_id", "host", "start_time", "end_time", "duration_s",
             "num_events", "max_score", "mean_score",
             "processes", "dest_ips", "labels",
         ])
@@ -58,34 +58,38 @@ def aggregate_alerts(
     if flagged.empty:
         print(f"  No events with valid SystemTime exceeded threshold {threshold:.2f}")
         return pd.DataFrame(columns=[
-            "chain_id", "start_time", "end_time", "duration_s",
+            "chain_id", "host", "start_time", "end_time", "duration_s",
             "num_events", "max_score", "mean_score",
             "processes", "dest_ips", "labels",
         ])
 
-    flagged = flagged.sort_values("SystemTime").reset_index(drop=True)
+    # host-scope: chain events within each machine separately so events from
+    # different computers are never merged into the same attack chain
+    chains: list = []
+    for host, host_flagged in flagged.groupby("Computer", sort=False):
+        host_flagged = (
+            host_flagged.sort_values("SystemTime").reset_index(drop=True)
+        )
+        chain_rows: list = [host_flagged.iloc[0]]
 
-    chains:     list = []
-    chain_rows: list = [flagged.iloc[0]]
+        for i in range(1, len(host_flagged)):
+            row  = host_flagged.iloc[i]
+            prev = chain_rows[-1]
+            try:
+                gap = (
+                    pd.Timestamp(row["SystemTime"]) -
+                    pd.Timestamp(prev["SystemTime"])
+                ).total_seconds()
+            except Exception:
+                gap = 0.0
 
-    for i in range(1, len(flagged)):
-        row  = flagged.iloc[i]
-        prev = chain_rows[-1]
-        try:
-            gap = (
-                pd.Timestamp(row["SystemTime"]) -
-                pd.Timestamp(prev["SystemTime"])
-            ).total_seconds()
-        except Exception:
-            gap = 0.0
+            if gap <= window_sec:
+                chain_rows.append(row)
+            else:
+                chains.append(_summarise(len(chains), chain_rows, str(host)))
+                chain_rows = [row]
 
-        if gap <= window_sec:
-            chain_rows.append(row)
-        else:
-            chains.append(_summarise(len(chains), chain_rows))
-            chain_rows = [row]
-
-    chains.append(_summarise(len(chains), chain_rows))
+        chains.append(_summarise(len(chains), chain_rows, str(host)))
 
     alerts_df = pd.DataFrame(chains)
     print(f"  {len(alerts_df)} alert chain(s) found "
@@ -95,7 +99,7 @@ def aggregate_alerts(
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _summarise(chain_id: int, rows: list) -> dict:
+def _summarise(chain_id: int, rows: list, host: str = "") -> dict:
     scores = [float(r["_score"]) for r in rows]
 
     processes = list(dict.fromkeys(
@@ -122,6 +126,7 @@ def _summarise(chain_id: int, rows: list) -> dict:
 
     return {
         "chain_id":   chain_id,
+        "host":       host,
         "start_time": start,
         "end_time":   end,
         "duration_s": dur,

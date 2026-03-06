@@ -205,16 +205,19 @@ def train_gnn(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def graph_anomaly_scores(model: HeteroGNNEncoder,
-                          data: HeteroData,
+                          full_data: HeteroData,
+                          benign_data: HeteroData,
                           process_enc) -> torch.Tensor:
     """
     Per-process-node anomaly score = reconstruction MSE, normalised to [0, 1].
 
-    The GNN is trained to minimise reconstruction error on benign nodes, so
-    nodes whose neighbourhood deviates from normal (attack processes with
-    unusual parent-child chains or network connections) will produce high
-    reconstruction error at inference.  This is directly consistent with the
-    training objective; the previous centroid-distance approach was not.
+    Uses benign node features (to avoid contamination from attack event
+    statistics) but the full graph's edge topology (to detect structural
+    anomalies such as new parent-child chains or novel IP connections).
+
+    Attack-only processes that have no benign events will have zero feature
+    vectors in benign_data (reindex fill_value=0.0) and will stand out as
+    anomalous in the reconstruction.
 
     Returns
     -------
@@ -222,10 +225,12 @@ def graph_anomaly_scores(model: HeteroGNNEncoder,
     """
     model.eval()
     device = next(model.parameters()).device
-    x_dict = {ntype: data[ntype].x.to(device) for ntype in data.node_types}
+    # node features from benign graph — not contaminated by attack statistics
+    x_dict = {ntype: benign_data[ntype].x.to(device) for ntype in full_data.node_types}
+    # edge topology from full graph — captures attack-introduced relationships
     edge_index_dict = {
-        etype: data[etype].edge_index.to(device)
-        for etype in data.edge_types
+        etype: full_data[etype].edge_index.to(device)
+        for etype in full_data.edge_types
     }
     with torch.no_grad():
         recon_dict = model(x_dict, edge_index_dict)   # encode + decode
@@ -235,7 +240,7 @@ def graph_anomaly_scores(model: HeteroGNNEncoder,
         recon_dict["process"], x_dict["process"], reduction="none"
     ).mean(dim=1)
 
-    # normalise to [0, 1]
+    # normalise to [0, 1] using benign range so attack scores can exceed 1
     mn, mx = recon_err.min(), recon_err.max()
     scores = (recon_err - mn) / (mx - mn + 1e-8)
     return scores.cpu()

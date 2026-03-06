@@ -10,23 +10,34 @@ Robustness
     from any Sysmon configuration (process-create only, network-only, mixed).
   · 'Label' defaults to 0 (benign) when absent, allowing label-free inference.
 
-Vectorisation
-─────────────
-  · All per-row operations use pandas str/vectorised ops (no apply() loops)
-    except cmd_entropy, which requires per-string Shannon entropy and is
-    optimised with numpy character counting instead of the original O(N²) loop.
+Encoding strategy
+─────────────────
+  Categorical columns (process_name, parent_process, parent_child, User,
+  IntegrityLevel) are encoded using deterministic CRC32 hashing normalised
+  to [0, 1]:
 
-Bug fix
-───────
-  · dest_external: original code applied bitwise ~ to an int Series, yielding
-    -1/-2 instead of 1/0. Fixed by inverting the bool Series before .astype(int).
+      hash_value = (zlib.crc32(s.encode("utf-8")) & 0xFFFFFFFF) / 0xFFFFFFFF
+
+  Benefits over sklearn LabelEncoder:
+    · Stable across runs (no PYTHONHASHSEED, no sort-order dependency)
+    · No fit/transform mismatch when new categories appear at inference
+    · Always produces values in [0, 1] — no extra scaling needed
+
+Bug fixes
+─────────
+  · dest_external: inverted the bool Series before .astype(int) to get 0/1
+    (original bitwise ~ on an int Series yielded -1/-2).
+  · RFC 1918: 172.16.0.0/12 range now correctly matched (172.16–172.31.x.x)
+    instead of the broad 172.* which captured public IPs.
 """
 
+import re
 import warnings
+import zlib
+
 import numpy as np
 import pandas as pd
 from collections import Counter
-from sklearn.preprocessing import LabelEncoder
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -45,6 +56,9 @@ _OPTIONAL_COLS: dict = {
     "DestinationIp":  None,       # NaN → no network event
     "DestinationPort": 0,
 }
+
+# RFC 1918 + loopback pattern
+_RFC1918 = re.compile(r"^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|127\.)")
 
 
 def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -72,6 +86,17 @@ def _entropy(s: str) -> float:
     counts = np.array(list(Counter(s).values()), dtype=np.float64)
     p = counts / counts.sum()
     return float(-np.sum(p * np.log2(p + 1e-12)))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Deterministic hashing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _crc32_series(series: pd.Series) -> pd.Series:
+    """Deterministic CRC32 hash of string values, normalised to [0, 1]."""
+    return series.fillna("unknown").astype(str).apply(
+        lambda x: (zlib.crc32(x.encode("utf-8")) & 0xFFFFFFFF) / 0xFFFFFFFF
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -107,7 +132,7 @@ def feature_engineering(df: pd.DataFrame):
     df["SystemTime"] = pd.to_datetime(df["SystemTime"], errors="coerce")
 
     # ── process name features (vectorised str ops) ────────────────────────────
-    df["process_name"]  = (
+    df["process_name"] = (
         df["Image"].fillna("unknown").astype(str)
         .str.split("\\").str[-1].str.lower()
     )
@@ -116,6 +141,11 @@ def feature_engineering(df: pd.DataFrame):
         .str.split("\\").str[-1].str.lower()
     )
     df["parent_child"] = df["parent_process"] + "->" + df["process_name"]
+
+    # ── encode categoricals via deterministic CRC32 hash ─────────────────────
+    for col in ["process_name", "parent_process", "parent_child",
+                "User", "IntegrityLevel"]:
+        df[col] = _crc32_series(df[col].fillna("unknown").astype(str))
 
     # ── command-line features (vectorised) ────────────────────────────────────
     cmd = df["CommandLine"].fillna("").astype(str)
@@ -133,7 +163,6 @@ def feature_engineering(df: pd.DataFrame):
     # ── path features (vectorised) ────────────────────────────────────────────
     img = df["Image"].fillna("").astype(str)
 
-    # str.count() uses regex; r"\\" matches a single backslash
     df["path_depth"]   = img.str.count(r"\\")
     df["is_system32"]  = img.str.contains("system32", case=False, na=False).astype(int)
     df["is_users_dir"] = img.str.contains("users",    case=False, na=False).astype(int)
@@ -148,32 +177,30 @@ def feature_engineering(df: pd.DataFrame):
     # ── network features ──────────────────────────────────────────────────────
     df["dest_port"] = pd.to_numeric(df["DestinationPort"], errors="coerce").fillna(0)
 
-    # BUG FIX: invert bool Series *before* .astype(int) to get 0/1 not -2/-1
+    # RFC 1918 fix: proper 172.16.0.0/12 detection; bool inversion before .astype(int)
     df["dest_external"] = (
-        ~df["DestinationIp"].fillna("").astype(str)
-        .str.startswith(("10.", "192.168.", "172."))
+        ~df["DestinationIp"].fillna("").astype(str).apply(
+            lambda ip: bool(_RFC1918.match(ip)) or ip == ""
+        )
     ).astype(int)
 
     # ── temporal features ─────────────────────────────────────────────────────
-    df["hour"]          = df["SystemTime"].dt.hour.fillna(0).astype(int)
+    df["hour"]           = df["SystemTime"].dt.hour.fillna(0).astype(int)
     df["is_after_hours"] = (
         (df["hour"] < 7) | (df["hour"] > 19)
     ).astype(int)
 
-    # ── encode categoricals ───────────────────────────────────────────────────
-    encoders: dict = {}
-    for col in ["process_name", "parent_process", "parent_child",
-                "User", "IntegrityLevel"]:
-        le = LabelEncoder()
-        df[col] = le.fit_transform(df[col].fillna("unknown").astype(str))
-        encoders[col] = le
-
+    # ── feature column lists ─────────────────────────────────────────────────
+    # CRC32-hashed categoricals come first (already in [0,1]); numeric cols follow.
+    # The normaliser skips the first N_CATEGORICAL_FEATURES columns.
     feature_cols = [
+        # CRC32-hashed categoricals (already [0, 1] — not z-scored)
         "process_name",
         "parent_process",
         "parent_child",
         "User",
         "IntegrityLevel",
+        # numeric features (z-scored by normaliser)
         "cmd_length",
         "cmd_token_count",
         "has_base64",
@@ -192,3 +219,8 @@ def feature_engineering(df: pd.DataFrame):
     ]
 
     return df, feature_cols
+
+
+# Number of CRC32-hashed categorical columns at the start of feature_cols.
+# normaliser.py uses this to skip z-scoring them.
+N_CATEGORICAL_FEATURES = 5
