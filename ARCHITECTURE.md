@@ -39,6 +39,12 @@ missed entirely).
 ```
 Sysmon CSV (raw endpoint telemetry)
         │
+        ▼  [0] EventID Filter
+        │       Retain only EventID 1 (process creation) and
+        │       EventID 3 (network connection) — applied once at
+        │       load time; all engines, training, validation,
+        │       inference, and evaluation use this same subset
+        │
         ▼  [1] Feature Engineering
         │       Convert raw log columns → 20 numeric features per event
         │
@@ -434,9 +440,18 @@ observed on **benign events only**.  This prevents attack scores from
 compressing the normalised range and making themselves appear less anomalous
 (test-set leakage via the normalisation step).
 
-Leading events that do not have a full 20-event window (and therefore no
-reconstruction error) are treated as baseline (score=0) rather than being
-penalised.
+Because the EventID filter is applied globally at load time, every event in the
+dataset is a candidate for transformer scoring. The only events that remain
+unscored are the **warmup events** — the first `(SEQUENCE_LENGTH - 1) = 19`
+events per host that do not yet have a full sliding window. For these warmup
+events, `RECON_WEIGHT` (0.5) is redistributed proportionally to the two
+available signals so the composite score still sums to 1.0:
+
+```
+warmup composite = (GRAPH_WEIGHT / remain) × graph_score
+                 + (RARITY_WEIGHT / remain) × rarity_score
+  where remain = GRAPH_WEIGHT + RARITY_WEIGHT = 0.5
+```
 
 **Weight rationale:**
 
@@ -503,6 +518,7 @@ Key metrics reported:
 |----------|-----------|
 | **Unsupervised / benign-only training** | Attack samples are rare and evolve constantly; training on normal behaviour generalises to novel attacks |
 | **Three-signal ensemble** | Each signal has different blind spots; fusion reduces both false positives and false negatives |
+| **Global EventID 1 & 3 filter at load time** | EventID 1 (process creation) and 3 (network connection) carry the strongest attack signal. Filtering once at load time ensures all three engines, training, validation, inference, and evaluation metrics operate on the same consistent population, eliminating any possibility of engine-to-engine scope mismatch |
 | **Heterogeneous graph (not homogeneous)** | Processes, IPs, users, and hosts have fundamentally different semantics; mixing them into one node type would destroy information |
 | **GraphSAGE (not GCN or GAT)** | Scales to large graphs without requiring full-batch training; inductive (generalises to unseen nodes) |
 | **Transformer (not LSTM)** | Self-attention captures arbitrary-range event dependencies; LSTMs struggle with long-range patterns |
