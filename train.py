@@ -15,6 +15,12 @@ Improvements over the original implementation
     relatively small benign subset.
   · Fixed random seed for reproducibility.
   · Best-model checkpoint: restores the lowest-validation-loss weights.
+  · Automatic Mixed Precision (AMP) — uses FP16 on CUDA via Tensor Cores
+    for ~2× throughput; GradScaler keeps gradients numerically stable.
+  · num_workers=4 + pin_memory — prefetch batches on CPU while GPU trains,
+    eliminating the data-loading bottleneck.
+  · Val loader built once outside the epoch loop — avoids re-allocating
+    the validation tensor on every epoch.
 """
 
 import copy
@@ -69,15 +75,32 @@ def train_model(
     X_tr    = X_shuffled[n_val:]
     X_val   = X_shuffled[:n_val] if n_val > 0 else None
 
-    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_cuda  = torch.cuda.is_available()
+    device    = torch.device("cuda" if use_cuda else "cpu")
     model     = model.to(device)
+
+    # AMP: FP16 forward/backward via Tensor Cores on CUDA; no-op on CPU
+    scaler = torch.amp.GradScaler("cuda", enabled=use_cuda)
+
+    _loader_kwargs = dict(
+        num_workers      = 4 if use_cuda else 0,
+        pin_memory       = use_cuda,
+        persistent_workers = use_cuda,   # keep workers alive across epochs
+    )
 
     tr_ds     = TensorDataset(torch.tensor(X_tr).float())
     tr_loader = DataLoader(
         tr_ds, batch_size=batch_size, shuffle=True,
-        num_workers=0,
         generator=torch.Generator().manual_seed(RANDOM_SEED),
+        **_loader_kwargs,
     )
+
+    # Build val loader once — avoids re-allocating the tensor every epoch
+    val_loader = None
+    if X_val is not None:
+        val_ds     = TensorDataset(torch.tensor(X_val).float())
+        val_loader = DataLoader(val_ds, batch_size=batch_size * 4,
+                                shuffle=False, **_loader_kwargs)
 
     optimizer   = torch.optim.AdamW(model.parameters(), lr=lr,
                                      weight_decay=_WEIGHT_DECAY)
@@ -95,27 +118,28 @@ def train_model(
         model.train()
         train_loss = 0.0
         for (x,) in tr_loader:
-            x = x.to(device)
+            x = x.to(device, non_blocking=True)
             optimizer.zero_grad()
-            loss = criterion(model(x), x)
-            loss.backward()
+            with torch.amp.autocast("cuda", enabled=use_cuda):
+                loss = criterion(model(x), x)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             train_loss += loss.item()
         train_loss /= len(tr_loader)
 
         # ── validate ──────────────────────────────────────────────────────────
-        if X_val is not None:
+        if val_loader is not None:
             model.eval()
-            val_ds     = TensorDataset(torch.tensor(X_val).float())
-            val_loader = DataLoader(val_ds, batch_size=batch_size * 4,
-                                    shuffle=False, num_workers=0)
             val_loss = 0.0
             with torch.no_grad():
                 for (xv,) in val_loader:
-                    xv = xv.to(device)
-                    val_loss += criterion(model(xv), xv).item()
+                    xv = xv.to(device, non_blocking=True)
+                    with torch.amp.autocast("cuda", enabled=use_cuda):
+                        val_loss += criterion(model(xv), xv).item()
             val_loss /= max(len(val_loader), 1)
             monitor = val_loss
             print(
