@@ -10,19 +10,20 @@ Combines three anomaly signals into a composite event score.
 All three input arrays must be aligned to the same event index.
 Each component is min-max normalised before weighting.
 
-Weight redistribution for unscored events
-─────────────────────────────────────────
-The transformer only scores EventID-1/3 events.  For all other events
-recon_error is NaN.  Filling NaN with 0 and using the same weights caps
-unscored events at (GRAPH_WEIGHT + RARITY_WEIGHT) = 0.65, creating a
-systematic ceiling gap versus scored events (max = 1.0).
+Weight redistribution for warmup events
+────────────────────────────────────────
+The pipeline now filters to EventID 1 & 3 globally, so every event is
+eligible for transformer scoring.  However, the first (SEQUENCE_LENGTH - 1)
+events per host have no full sliding window and therefore receive NaN
+recon_error (warmup period).
 
-Fix: detect unscored events BEFORE normalisation and redistribute
-RECON_WEIGHT proportionally across the two available components so both
-groups use a composite that sums to 1.0:
+Filling NaN with 0 and applying the standard weights would cap warmup
+events at (GRAPH_WEIGHT + RARITY_WEIGHT) = 0.65, while fully-scored events
+can reach 1.0.  To keep both groups on equal footing, RECON_WEIGHT is
+redistributed proportionally to the two available signals for warmup events:
 
     scored   → RECON_WEIGHT·r + GRAPH_WEIGHT·g + RARITY_WEIGHT·s
-    unscored → (GRAPH_WEIGHT / remain)·g + (RARITY_WEIGHT / remain)·s
+    warmup   → (GRAPH_WEIGHT / remain)·g + (RARITY_WEIGHT / remain)·s
                where remain = GRAPH_WEIGHT + RARITY_WEIGHT
 """
 
@@ -41,8 +42,8 @@ def compute_anomaly_scores(
     Parameters
     ----------
     recon_errors  : (N,)  MSE reconstruction error per sequence (transformer)
-                          May contain NaN for events not scored by the transformer
-                          (non-EventID-1/3 events and leading warmup events).
+                          May contain NaN for the first (SEQUENCE_LENGTH - 1)
+                          events per host (warmup — no full window available).
     graph_scores  : (N,)  GNN reconstruction error per event
     rarity_scores : (N,)  rare-behaviour score per event
     labels        : (N,)  event labels (0 = benign).  When provided, min-max
@@ -99,6 +100,6 @@ def _normalise(arr: np.ndarray,
     if mx - mn < 1e-6:
         return np.zeros_like(arr, dtype=np.float32)
     result = (arr - mn) / (mx - mn)
-    # fill NaN with 0 – treat unscored events as baseline-normal within their
-    # component; weight redistribution in compute_anomaly_scores handles the rest.
+    # fill NaN with 0 – warmup events are baseline-normal within this component;
+    # weight redistribution in compute_anomaly_scores handles the ceiling parity.
     return np.where(np.isnan(result), 0.0, result).astype(np.float32)

@@ -5,6 +5,9 @@ Full end-to-end pipeline:
 
   Sysmon CSV
     │
+    ▼  EventID filter [1, 3] only  ← applied at load time; all three engines
+    │                                  and all evaluation metrics use only these
+    │                                  two high-signal event types
     ▼  feature_engineering.py      (vectorised; missing columns filled safely)
   Tabular feature matrix  +  enriched DataFrame
     │
@@ -24,9 +27,7 @@ Full end-to-end pipeline:
     │       ▼
     │   rarity_scores              (N_events,)
     │
-    ├─► EventID filter [1, 3] only  ← transformer sees only high-signal types
-    │       │                          so it can distinguish attack vs benign
-    │       ▼  sequence_builder.py
+    ├─► sequence_builder.py
     │   sliding-window sequences   small → in-memory ndarray
     │                              large → np.memmap on disk
     │       │
@@ -104,10 +105,19 @@ def main():
         print("      Evaluation metrics will not be meaningful.")
         df["Label"] = 0
 
-    n_events   = len(df)
+    # ── EventID filter (applied once, globally) ───────────────────────────────
+    # Retain only EventID 1 (process creation) and 3 (network connection).
+    # All three engines (GNN, rarity, transformer), training, inference, and
+    # evaluation metrics operate exclusively on these two event types.
+    n_raw = len(df)
+    df["EventID"] = pd.to_numeric(df["EventID"], errors="coerce")
+    df = df[df["EventID"].isin(HIGH_SIGNAL_EVENTIDS)].reset_index(drop=True)
+    n_events = len(df)
+    print(f"      EventID filter: {n_raw:,} → {n_events:,} events "
+          f"(kept EventIDs {HIGH_SIGNAL_EVENTIDS})")
+
     use_memmap = n_events > LARGE_DATASET_THRESHOLD
-    print(f"      {n_events:,} events — "
-          f"{'large (memmap)' if use_memmap else 'small (in-memory)'} mode")
+    print(f"      {'large (memmap)' if use_memmap else 'small (in-memory)'} mode")
 
     # ── 2. feature engineering ────────────────────────────────────────────────
     print("\n[2/9] Feature engineering...")
@@ -169,33 +179,14 @@ def main():
     print(f"      mean rarity score: {event_rarity_scores.mean():.4f}")
 
     # ── 8. sequences + transformer autoencoder ────────────────────────────────
-    #
-    # WHY we filter here and not globally:
-    #   When trained on ALL event types, the transformer learns to reconstruct
-    #   benign module-loads, registry writes, and terminations — events that look
-    #   identical in attacks and normal operation.  The resulting model reconstructs
-    #   attack sequences just as well as benign ones → AUC ≈ 0.50 (non-discriminative).
-    #
-    #   EventID 1 (process creation) and 3 (network connection) carry the strongest
-    #   attack signal.  Restricting the transformer to these two types focuses its
-    #   anomaly signal exactly where attacks deviate from normal behaviour.
-    #
-    #   The GNN (steps 4-6) and rarity engine (step 7) intentionally keep all events:
-    #   they extract structural and frequency-based signals that benefit from full context.
-    #
     print(f"\n[8/9] Building sequences & training Transformer autoencoder...")
-    df["EventID"] = pd.to_numeric(df["EventID"], errors="coerce")
-    df_seq        = df[df["EventID"].isin(HIGH_SIGNAL_EVENTIDS)]
-    n_seq_events  = len(df_seq)
-    use_memmap_seq = n_seq_events > LARGE_DATASET_THRESHOLD
-    print(f"      EventID filter: {n_events:,} → {n_seq_events:,} rows "
-          f"(kept EventIDs {HIGH_SIGNAL_EVENTIDS})")
+    print(f"      {n_events:,} events (EventIDs {HIGH_SIGNAL_EVENTIDS} only)")
 
-    if use_memmap_seq:
+    if use_memmap:
         # ── large-dataset path ────────────────────────────────────────────────
         print(f"      Writing sequences to {SEQ_MEMMAP_PATH} ...")
         n_seq, seq_shape = build_sequences_memmap(
-            df_seq, feature_cols, SEQUENCE_LENGTH,
+            df, feature_cols, SEQUENCE_LENGTH,
             SEQ_MEMMAP_PATH, LABELS_MEMMAP_PATH,
         )
         print(f"      {n_seq:,} sequences of length {SEQUENCE_LENGTH} (on disk)")
@@ -219,7 +210,7 @@ def main():
 
     else:
         # ── small-dataset path ────────────────────────────────────────────────
-        X, y_s = build_sequences(df_seq, feature_cols, SEQUENCE_LENGTH)
+        X, y_s = build_sequences(df, feature_cols, SEQUENCE_LENGTH)
         print(f"      {X.shape[0]:,} sequences of length {SEQUENCE_LENGTH}")
 
         X_train = X[y_s == TRAIN_LABEL]
@@ -238,34 +229,29 @@ def main():
 
     # ── align sequence scores back to the full event array ────────────────────
     #
-    # build_sequences / build_sequences_memmap iterate df_seq host-by-host and
+    # build_sequences / build_sequences_memmap iterate df host-by-host and
     # produce sequences in that order.  Each host contributes
     # (n_host_events - SEQUENCE_LENGTH + 1) windows; the j-th window ends at
-    # host_df.index[j + SEQUENCE_LENGTH - 1] in the ORIGINAL df index space.
-    #
-    # The earlier flat-slice approach
-    #   last_event_idx = df_seq.index[SEQUENCE_LENGTH-1 : SEQUENCE_LENGTH-1+n_seq]
-    # was wrong for multi-host data: it treated the per-host warmup periods as a
-    # single global warmup, mapping every sequence to the wrong original row.
-    #
-    # The corrected approach mirrors the exact per-host iteration of the sequence
-    # builder so that seq_recon_errors[k] maps to the correct event in df.
+    # host_df.index[j + SEQUENCE_LENGTH - 1].
+    # The index is a contiguous RangeIndex 0..n_events-1 (reset at load time),
+    # so host_df.index values are direct positions in event_recon_errors.
+    # The first (SEQUENCE_LENGTH - 1) events per host have no full window and
+    # remain NaN; the anomaly engine redistributes their weights accordingly.
     #
     event_recon_errors = np.full(n_events, np.nan, dtype=np.float32)
     seq_offset = 0
-    for host in df_seq["Computer"].unique():
-        host_df  = df_seq[df_seq["Computer"] == host]
-        n_host   = len(host_df)
-        n_win    = n_host - SEQUENCE_LENGTH + 1
+    for host in df["Computer"].unique():
+        host_df = df[df["Computer"] == host]
+        n_host  = len(host_df)
+        n_win   = n_host - SEQUENCE_LENGTH + 1
         if n_win <= 0:
             continue
-        # host_df.index holds the original positions in df (never reset after filter)
         last_idxs = host_df.index[SEQUENCE_LENGTH - 1 : SEQUENCE_LENGTH - 1 + n_win]
         event_recon_errors[last_idxs] = seq_recon_errors[seq_offset : seq_offset + n_win]
         seq_offset += n_win
     n_valid = (~np.isnan(event_recon_errors)).sum()
     print(f"      mean recon error : {np.nanmean(event_recon_errors):.4f}  "
-          f"({n_valid:,} events scored, {n_events - n_valid:,} set to NaN)")
+          f"({n_valid:,} events scored, {n_events - n_valid:,} warmup NaN)")
 
     # ── 9. composite scores, alerts, evaluation ────────────────────────────────
     print("\n[9/9] Composite scoring, alerts & evaluation...")
