@@ -238,17 +238,31 @@ def main():
 
     # ── align sequence scores back to the full event array ────────────────────
     #
-    # df_seq is a filtered subset of df.  Its .index values are original row
-    # positions in df (RangeIndex 0..n_events-1, never reset after filtering).
-    # Sequence i spans df_seq rows i..i+SEQUENCE_LENGTH-1, associated with the
-    # LAST event in the window: df_seq.index[i + SEQUENCE_LENGTH - 1].
-    # Events not in df_seq (non-1/3 EventIDs) and events before the first full
-    # window receive NaN — the anomaly engine treats NaN as 0 after normalising.
+    # build_sequences / build_sequences_memmap iterate df_seq host-by-host and
+    # produce sequences in that order.  Each host contributes
+    # (n_host_events - SEQUENCE_LENGTH + 1) windows; the j-th window ends at
+    # host_df.index[j + SEQUENCE_LENGTH - 1] in the ORIGINAL df index space.
+    #
+    # The earlier flat-slice approach
+    #   last_event_idx = df_seq.index[SEQUENCE_LENGTH-1 : SEQUENCE_LENGTH-1+n_seq]
+    # was wrong for multi-host data: it treated the per-host warmup periods as a
+    # single global warmup, mapping every sequence to the wrong original row.
+    #
+    # The corrected approach mirrors the exact per-host iteration of the sequence
+    # builder so that seq_recon_errors[k] maps to the correct event in df.
     #
     event_recon_errors = np.full(n_events, np.nan, dtype=np.float32)
-    n_seq              = len(seq_recon_errors)
-    last_event_idx     = df_seq.index[SEQUENCE_LENGTH - 1 : SEQUENCE_LENGTH - 1 + n_seq]
-    event_recon_errors[last_event_idx] = seq_recon_errors
+    seq_offset = 0
+    for host in df_seq["Computer"].unique():
+        host_df  = df_seq[df_seq["Computer"] == host]
+        n_host   = len(host_df)
+        n_win    = n_host - SEQUENCE_LENGTH + 1
+        if n_win <= 0:
+            continue
+        # host_df.index holds the original positions in df (never reset after filter)
+        last_idxs = host_df.index[SEQUENCE_LENGTH - 1 : SEQUENCE_LENGTH - 1 + n_win]
+        event_recon_errors[last_idxs] = seq_recon_errors[seq_offset : seq_offset + n_win]
+        seq_offset += n_win
     n_valid = (~np.isnan(event_recon_errors)).sum()
     print(f"      mean recon error : {np.nanmean(event_recon_errors):.4f}  "
           f"({n_valid:,} events scored, {n_events - n_valid:,} set to NaN)")

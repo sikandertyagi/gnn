@@ -44,20 +44,22 @@ GNN_MODEL_PATH           = "gnn_encoder.pt"
 GNN_EARLY_STOPPING_PAT   = 5        # patience for GNN training
 
 # ── anomaly scoring weights  (must sum to 1.0) ────────────────────────────
-# Weights derived from per-component ablation (see metrics.py output):
-#   rarity_score  AUC = 0.9717  ← strongest discriminator → highest weight
-#   graph_score   AUC = 0.7011  ← second best
-#   recon_error   AUC ≈ 0.50    ← weakest; transformer learns the mean of
-#                                    benign sequences and reconstructs attack
-#                                    sequences equally well → not discriminative
+# NOTE: the old ablation AUCs below were measured on a broken pipeline:
+#   · recon_error AUC ≈ 0.50 was an artefact of two bugs —
+#       (a) multi-host alignment error scrambling sequence→event mapping
+#       (b) rare_process_score / has_ip / has_download / has_encodedcommand /
+#           eventid features missing from the transformer input
+#     Both bugs are now fixed.  Re-run main.py and read roc_auc_recon_error
+#     from metrics.json to derive updated weights.
 #
-# Previous allocation (RECON=0.5, RARITY=0.2) gave composite AUC = 0.8352,
-# which is lower than rarity alone (0.9717).  The heavy recon weight was
-# actively diluting the best signal.  Corrected weights bring the composite
-# closer to the rarity ceiling.
-RECON_WEIGHT  = 0.2         # transformer reconstruction error (weakest)
-GRAPH_WEIGHT  = 0.3         # GNN graph anomaly score
-RARITY_WEIGHT = 0.5         # rare behaviour score (strongest ablation AUC)
+# Interim weights give the transformer equal footing with the rarity engine
+# pending re-derivation from fresh ablation results:
+#   rarity_score  AUC = 0.9717  (old; expected similar)
+#   graph_score   AUC = 0.7011  (old; expected similar)
+#   recon_error   AUC ≈ 0.50    (old; expected much higher after fixes)
+RECON_WEIGHT  = 0.35        # transformer reconstruction error (re-derive after fixes)
+GRAPH_WEIGHT  = 0.25        # GNN graph anomaly score
+RARITY_WEIGHT = 0.40        # rare behaviour score
 
 # ── alert aggregation ─────────────────────────────────────────────────────
 # Previous value (0.6) was above the attack score ceiling (~0.29 with old

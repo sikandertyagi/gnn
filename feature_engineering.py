@@ -55,6 +55,7 @@ _OPTIONAL_COLS: dict = {
     "Company":        None,       # NaN → missing_company = 1
     "DestinationIp":  None,       # NaN → no network event
     "DestinationPort": 0,
+    "EventID":        0,
 }
 
 # RFC 1918 + loopback pattern
@@ -100,6 +101,30 @@ def _crc32_series(series: pd.Series) -> pd.Series:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Command-line attack-indicator helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _has_ip(cmd: pd.Series) -> pd.Series:
+    """Detects bare IP addresses in command line — common in C2 / reverse shells."""
+    return cmd.str.contains(
+        r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", regex=True, na=False
+    ).astype(int)
+
+
+def _has_download(cmd: pd.Series) -> pd.Series:
+    """Detects download-related keywords — droppers / stagers."""
+    pattern = r"wget|curl|invoke-webrequest|\biwr\b|downloadstring|downloadfile|bitsadmin|start-bitstransfer"
+    return cmd.str.contains(pattern, case=False, regex=True, na=False).astype(int)
+
+
+def _has_encodedcommand(cmd: pd.Series) -> pd.Series:
+    """Detects PowerShell -EncodedCommand / -enc flag."""
+    return cmd.str.contains(
+        r"-(?:enc|encodedcommand)\b", case=False, regex=True, na=False
+    ).astype(int)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Public helpers (kept for graph_builder imports)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -142,6 +167,15 @@ def feature_engineering(df: pd.DataFrame):
     )
     df["parent_child"] = df["parent_process"] + "->" + df["process_name"]
 
+    # ── rare-process score: 1/frequency ───────────────────────────────────────
+    # Computed on raw process_name strings BEFORE CRC32 hashing so that
+    # frequency counts are meaningful.  Attack processes are rare → high score.
+    # Stays in (0, 1] naturally; not z-scored by the normaliser.
+    freq = df["process_name"].value_counts()
+    df["rare_process_score"] = df["process_name"].map(
+        lambda x: 1.0 / freq.get(x, 1)
+    )
+
     # ── encode categoricals via deterministic CRC32 hash ─────────────────────
     for col in ["process_name", "parent_process", "parent_child",
                 "User", "IntegrityLevel"]:
@@ -150,15 +184,23 @@ def feature_engineering(df: pd.DataFrame):
     # ── command-line features (vectorised) ────────────────────────────────────
     cmd = df["CommandLine"].fillna("").astype(str)
 
-    df["cmd_length"]      = cmd.str.len()
-    df["cmd_token_count"] = cmd.str.split().str.len().fillna(0).astype(int)
-    df["has_base64"]      = cmd.str.contains(
+    df["cmd_length"]         = cmd.str.len()
+    df["cmd_token_count"]    = cmd.str.split().str.len().fillna(0).astype(int)
+    df["has_base64"]         = cmd.str.contains(
         r"[A-Za-z0-9+/]{20,}={0,2}", regex=True, na=False
     ).astype(int)
-    df["has_http"]        = cmd.str.contains("http", case=False, na=False).astype(int)
+    df["has_http"]           = cmd.str.contains("http", case=False, na=False).astype(int)
+    df["has_ip"]             = _has_ip(cmd)
+    df["has_download"]       = _has_download(cmd)
+    df["has_encodedcommand"] = _has_encodedcommand(cmd)
 
     # Shannon entropy via optimised Python function (unavoidably per-row)
     df["cmd_entropy"] = cmd.apply(_entropy)
+
+    # ── event type ────────────────────────────────────────────────────────────
+    df["eventid"] = pd.to_numeric(
+        df["EventID"].fillna(0), errors="coerce"
+    ).fillna(0).astype(int)
 
     # ── path features (vectorised) ────────────────────────────────────────────
     img = df["Image"].fillna("").astype(str)
@@ -194,17 +236,21 @@ def feature_engineering(df: pd.DataFrame):
     # CRC32-hashed categoricals come first (already in [0,1]); numeric cols follow.
     # The normaliser skips the first N_CATEGORICAL_FEATURES columns.
     feature_cols = [
-        # CRC32-hashed categoricals (already [0, 1] — not z-scored)
+        # CRC32-hashed categoricals + rare_process_score (already in [0,1] — not z-scored)
         "process_name",
         "parent_process",
         "parent_child",
         "User",
         "IntegrityLevel",
+        "rare_process_score",
         # numeric features (z-scored by normaliser)
         "cmd_length",
         "cmd_token_count",
         "has_base64",
         "has_http",
+        "has_ip",
+        "has_download",
+        "has_encodedcommand",
         "cmd_entropy",
         "path_depth",
         "is_system32",
@@ -216,11 +262,15 @@ def feature_engineering(df: pd.DataFrame):
         "dest_external",
         "hour",
         "is_after_hours",
+        "eventid",
     ]
 
     return df, feature_cols
 
 
-# Number of CRC32-hashed categorical columns at the start of feature_cols.
-# normaliser.py uses this to skip z-scoring them.
-N_CATEGORICAL_FEATURES = 5
+# Columns at the START of feature_cols that are already in [0, 1] and must
+# NOT be z-scored by normaliser.py:
+#   process_name, parent_process, parent_child — CRC32 hashes
+#   User, IntegrityLevel                       — CRC32 hashes
+#   rare_process_score                         — 1/frequency, naturally (0,1]
+N_CATEGORICAL_FEATURES = 6
