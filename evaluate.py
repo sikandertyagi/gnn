@@ -17,7 +17,6 @@ def anomaly_scores(model, X, batch_size=256):
     """Return per-sequence reconstruction MSE for all sequences in X."""
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     model.eval()
 
     loader = DataLoader(
@@ -26,12 +25,10 @@ def anomaly_scores(model, X, batch_size=256):
     )
 
     scores = []
-
     with torch.no_grad():
-        for batch in loader:
-            x = batch[0].to(device)
+        for (x,) in loader:
+            x = x.to(device)
             recon = model(x)
-            # MSE per sequence: mean over time-steps and features
             mse = torch.mean((x - recon) ** 2, dim=(1, 2))
             scores.extend(mse.cpu().numpy())
 
@@ -42,22 +39,30 @@ def evaluate_metrics(scores, labels):
     """
     Compute full anomaly-detection metrics.
 
-    Training was on label 0 (normal).
-    Anomalous = labels 1 or 2.
+    Training was on label 0 (normal). Anomalous = labels != 0.
     Higher reconstruction score => more anomalous.
-    """
 
-    binary_labels = (labels != 0).astype(int)   # 0 = normal, 1 = anomaly
+    Gracefully handles the edge case where all labels are 0
+    (no anomalies in the evaluation set) by skipping metric computation.
+    """
+    binary_labels = (labels != 0).astype(int)
+
+    if binary_labels.sum() == 0:
+        print("\nNo anomalous sequences in evaluation set — metrics skipped.")
+        return {}
+
+    if binary_labels.sum() == len(binary_labels):
+        print("\nAll sequences are anomalous — metrics skipped.")
+        return {}
 
     auroc = roc_auc_score(binary_labels, scores)
     auprc = average_precision_score(binary_labels, scores)
 
     # Best threshold via Youden's J  (max TPR - FPR on the ROC curve)
     fpr, tpr, thresholds = roc_curve(binary_labels, scores)
-    best_thresh = thresholds[np.argmax(tpr - fpr)]
+    best_thresh = float(thresholds[np.argmax(tpr - fpr)])
 
-    preds = (scores >= best_thresh).astype(int)
-
+    preds     = (scores >= best_thresh).astype(int)
     precision = precision_score(binary_labels, preds, zero_division=0)
     recall    = recall_score(binary_labels, preds, zero_division=0)
     f1        = f1_score(binary_labels, preds, zero_division=0)
@@ -75,15 +80,17 @@ def evaluate_metrics(scores, labels):
     print(f"{'Actual Normal':15s}  {cm[0, 0]:11d}  {cm[0, 1]:12d}")
     print(f"{'Actual Anomaly':15s}  {cm[1, 0]:11d}  {cm[1, 1]:12d}")
     print(f"\nClassification Report:")
-    print(classification_report(binary_labels, preds, target_names=["Normal", "Anomaly"], zero_division=0))
+    print(classification_report(binary_labels, preds,
+                                target_names=["Normal", "Anomaly"],
+                                zero_division=0))
     print("================================================\n")
 
     return {
-        "auroc": auroc,
-        "auprc": auprc,
-        "threshold": best_thresh,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
+        "auroc":            auroc,
+        "auprc":            auprc,
+        "threshold":        best_thresh,
+        "precision":        precision,
+        "recall":           recall,
+        "f1":               f1,
         "confusion_matrix": cm,
     }

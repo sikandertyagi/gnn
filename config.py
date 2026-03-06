@@ -17,3 +17,6 @@ VAL_RATIO = 0.2
 
 MODEL_PATH = "transformer_autoencoder.pt"
 SCALER_PATH = "scaler.pkl"
+
+# Fixed seed for reproducible training shuffles and DataLoader workers
+RANDOM_SEED = 42

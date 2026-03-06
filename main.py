@@ -4,8 +4,11 @@ import torch
 import joblib
 from sklearn.preprocessing import StandardScaler
 
-from config import *
-from feature_engineering import feature_engineering
+from config import (
+    DATA_PATH, SEQUENCE_LENGTH, TRAIN_LABEL, BATCH_SIZE,
+    EPOCHS, LEARNING_RATE, VAL_RATIO, MODEL_PATH, SCALER_PATH,
+)
+from feature_engineering import feature_engineering, N_CATEGORICAL_FEATURES
 from sequence_builder import build_sequences
 from transformer_autoencoder import TransformerAutoencoder
 from train import train_model
@@ -42,21 +45,33 @@ def main():
     print(f"Anomalous       : {X[y != TRAIN_LABEL].shape}")
 
     # ------------------------------------------------------------------
-    # Feature normalisation — fit ONLY on benign training data
+    # Feature normalisation — fit ONLY on benign training data.
+    # The first N_CATEGORICAL_FEATURES columns are CRC32-hashed to [0,1]
+    # already; z-scoring them is semantically meaningless, so the scaler
+    # is applied only to the remaining numeric columns.
     # ------------------------------------------------------------------
-    print("Fitting StandardScaler on benign data...")
+    print("Fitting StandardScaler on benign numeric features...")
     n_samples, seq_len, n_features = X_train.shape
 
+    numeric_start = N_CATEGORICAL_FEATURES   # skip the CRC32-hashed columns
     scaler = StandardScaler()
-    scaler.fit(X_train.reshape(-1, n_features))
 
-    X_train_scaled = scaler.transform(
-        X_train.reshape(-1, n_features)
-    ).reshape(X_train.shape)
+    # Fit on benign numeric features only (flattened over time steps)
+    scaler.fit(
+        X_train[:, :, numeric_start:].reshape(-1, n_features - numeric_start)
+    )
 
-    X_scaled = scaler.transform(
-        X.reshape(-1, n_features)
-    ).reshape(X.shape)
+    def _scale(X_arr):
+        """Apply scaler to numeric columns; leave categorical columns as-is."""
+        out = X_arr.copy()
+        flat = X_arr[:, :, numeric_start:].reshape(-1, n_features - numeric_start)
+        out[:, :, numeric_start:] = scaler.transform(flat).reshape(
+            X_arr.shape[0], seq_len, n_features - numeric_start
+        )
+        return out
+
+    X_train_scaled = _scale(X_train)
+    X_scaled       = _scale(X)
 
     joblib.dump(scaler, SCALER_PATH)
     print(f"Scaler saved → {SCALER_PATH}")
