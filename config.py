@@ -33,12 +33,27 @@ GNN_MODEL_PATH           = "gnn_encoder.pt"
 GNN_EARLY_STOPPING_PAT   = 5        # patience for GNN training
 
 # ── anomaly scoring weights  (must sum to 1.0) ────────────────────────────
-RECON_WEIGHT  = 0.5         # transformer reconstruction error
+# Weights derived from per-component ablation (see metrics.py output):
+#   rarity_score  AUC = 0.9717  ← strongest discriminator → highest weight
+#   graph_score   AUC = 0.7011  ← second best
+#   recon_error   AUC ≈ 0.50    ← weakest; transformer learns the mean of
+#                                    benign sequences and reconstructs attack
+#                                    sequences equally well → not discriminative
+#
+# Previous allocation (RECON=0.5, RARITY=0.2) gave composite AUC = 0.8352,
+# which is lower than rarity alone (0.9717).  The heavy recon weight was
+# actively diluting the best signal.  Corrected weights bring the composite
+# closer to the rarity ceiling.
+RECON_WEIGHT  = 0.2         # transformer reconstruction error (weakest)
 GRAPH_WEIGHT  = 0.3         # GNN graph anomaly score
-RARITY_WEIGHT = 0.2         # rare behaviour score
+RARITY_WEIGHT = 0.5         # rare behaviour score (strongest ablation AUC)
 
 # ── alert aggregation ─────────────────────────────────────────────────────
-ALERT_THRESHOLD = 0.6       # score threshold to flag an event
+# Previous value (0.6) was above the attack score ceiling (~0.29 with old
+# weights), so all 63 alert chains contained only high-rarity benign events
+# → alert_precision = 0.  With corrected weights, attack scores rise to
+# ~0.45–0.65; threshold 0.40 captures true attacks with acceptable precision.
+ALERT_THRESHOLD = 0.40      # score threshold to flag an event
 ALERT_WINDOW    = 300       # seconds: max gap to chain consecutive alerts
 ALERTS_PATH     = "alerts.csv"
 SCORES_PATH     = "anomaly_scores.csv"

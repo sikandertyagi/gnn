@@ -379,8 +379,20 @@ def _alert_metrics(df_alerts, df_events, labels, scores, threshold) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _safe_auc(fn, binary, scores):
+    """
+    Compute AUC safely, filtering out NaN score entries first.
+
+    NaN values arise legitimately in recon_error for leading events that have
+    no full sequence window (pad events).  Passing NaN to sklearn raises
+    ValueError and previously caused the entire component AUC to show as nan,
+    hiding whether the transformer was discriminative.
+    Filtering to valid (non-NaN) rows fixes this without discarding signal.
+    """
     try:
-        return round(float(fn(binary, scores)), 4)
+        mask = ~np.isnan(scores)
+        if mask.sum() < 2 or len(np.unique(binary[mask])) < 2:
+            return float("nan")
+        return round(float(fn(binary[mask], scores[mask])), 4)
     except Exception:
         return float("nan")
 
