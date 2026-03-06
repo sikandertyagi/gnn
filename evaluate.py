@@ -28,7 +28,8 @@ def anomaly_scores(model, X, batch_size: int = 512) -> np.ndarray:
     -------
     scores : (N,) float32 ndarray  — MSE reconstruction error per sequence
     """
-    device = next(model.parameters()).device
+    device   = next(model.parameters()).device
+    use_cuda = device.type == "cuda"
     model.eval()
 
     total   = len(X)
@@ -38,10 +39,11 @@ def anomaly_scores(model, X, batch_size: int = 512) -> np.ndarray:
         for i, start in enumerate(range(0, total, batch_size)):
             # np.array() materialises memmap slices into a contiguous buffer
             chunk = np.array(X[start : start + batch_size], dtype=np.float32)
-            x     = torch.from_numpy(chunk).to(device)
-            recon = model(x)
-            # MSE averaged over time and feature dimensions → one scalar per seq
-            mse   = torch.mean((x - recon) ** 2, dim=(1, 2))
+            x     = torch.from_numpy(chunk).to(device, non_blocking=True)
+            with torch.amp.autocast("cuda", enabled=use_cuda):
+                recon = model(x)
+            # cast to float32 before MSE to avoid FP16 precision loss
+            mse   = torch.mean((x - recon.float()) ** 2, dim=(1, 2))
             scores.append(mse.cpu().numpy())
             if (i + 1) % 100 == 0 or (i + 1) == n_batch:
                 print(f"\r      Inference: {i+1}/{n_batch} batches "

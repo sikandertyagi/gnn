@@ -149,11 +149,15 @@ def train_gnn(
     Early stopping monitors training loss (GNN training is full-graph, so there
     is no separate val set; the loss itself is a reliable convergence signal).
     """
-    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_cuda  = torch.cuda.is_available()
+    device    = torch.device("cuda" if use_cuda else "cpu")
     model     = model.to(device)
     print(f"  GNN training on {device}")
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
+
+    # AMP: FP16 message-passing on CUDA Tensor Cores; no-op on CPU
+    scaler = torch.amp.GradScaler("cuda", enabled=use_cuda)
 
     x_dict = {ntype: data[ntype].x.to(device) for ntype in data.node_types}
     edge_index_dict = {
@@ -169,17 +173,17 @@ def train_gnn(
         model.train()
         optimizer.zero_grad()
 
-        recon_dict = model(x_dict, edge_index_dict)
-        loss = sum(
-            criterion(recon_dict[ntype], x_dict[ntype])
-            for ntype in recon_dict
-        )
-        loss.backward()
-
-        # Fix #10: gradient clipping to prevent exploding gradients
+        with torch.amp.autocast("cuda", enabled=use_cuda):
+            recon_dict = model(x_dict, edge_index_dict)
+            loss = sum(
+                criterion(recon_dict[ntype], x_dict[ntype])
+                for ntype in recon_dict
+            )
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
         loss_val = loss.item()
         if epoch % 5 == 0 or epoch == 1:

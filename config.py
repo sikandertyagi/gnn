@@ -7,7 +7,7 @@ RANDOM_SEED = 42                    # set in main.py for numpy / torch / python
 SEQUENCE_LENGTH = 20
 TRAIN_LABEL     = 0                 # label value that denotes benign
 
-BATCH_SIZE    = 64
+BATCH_SIZE    = 512         # A5000 has 24 GB VRAM; 512 saturates the GPU
 EPOCHS        = 20
 LEARNING_RATE = 1e-3
 

@@ -73,12 +73,31 @@ def train_model(
     X_tr   = X_shuffled[n_val:]
     X_val  = X_shuffled[:n_val] if n_val > 0 else None
 
-    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model     = model.to(device)
+    use_cuda = torch.cuda.is_available()
+    device   = torch.device("cuda" if use_cuda else "cpu")
+    model    = model.to(device)
+
+    # AMP: FP16 forward/backward on CUDA via Tensor Cores; no-op on CPU
+    scaler = torch.amp.GradScaler("cuda", enabled=use_cuda)
+
+    _loader_kw = dict(
+        num_workers        = 4 if use_cuda else 0,  # parallel prefetch
+        pin_memory         = use_cuda,               # page-locked transfers
+        persistent_workers = use_cuda,               # keep workers alive
+    )
+
     tr_ds     = TensorDataset(torch.from_numpy(X_tr).float())
     tr_loader = DataLoader(tr_ds, batch_size=batch_size, shuffle=True,
-                           num_workers=0, pin_memory=(device.type == "cuda"),
-                           generator=torch.Generator().manual_seed(RANDOM_SEED))
+                           generator=torch.Generator().manual_seed(RANDOM_SEED),
+                           **_loader_kw)
+
+    # build val loader once — avoids reallocating the tensor every epoch
+    vl_loader = None
+    if X_val is not None:
+        vl_ds     = TensorDataset(torch.from_numpy(X_val).float())
+        vl_loader = DataLoader(vl_ds, batch_size=batch_size * 4,
+                               shuffle=False, **_loader_kw)
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = _build_scheduler(optimizer, epochs, len(tr_loader))
     criterion = nn.MSELoss()
@@ -93,23 +112,29 @@ def train_model(
         model.train()
         total = 0.0
         for (x,) in tr_loader:
-            x = x.to(device)
+            x = x.to(device, non_blocking=True)
             optimizer.zero_grad()
-            loss = criterion(model(x), x)
-            loss.backward()
-            # Fix #10: gradient clipping to prevent exploding gradients
+            with torch.amp.autocast("cuda", enabled=use_cuda):
+                loss = criterion(model(x), x)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             total += loss.item()
         tr_loss = total / len(tr_loader)
 
         # ── validate ──────────────────────────────────────────────────────────
-        if X_val is not None:
+        if vl_loader is not None:
             model.eval()
+            vl_total = 0.0
             with torch.no_grad():
-                xv  = torch.from_numpy(X_val).float().to(device)
-                vl  = criterion(model(xv), xv).item()
+                for (xv,) in vl_loader:
+                    xv = xv.to(device, non_blocking=True)
+                    with torch.amp.autocast("cuda", enabled=use_cuda):
+                        vl_total += criterion(model(xv), xv).item()
+            vl      = vl_total / len(vl_loader)
             monitor = vl
             print(f"Epoch {epoch+1:>3}/{epochs}  train={tr_loss:.4f}  val={vl:.4f}")
         else:
@@ -128,7 +153,6 @@ def train_model(
                       f"(best={best_loss:.4f})")
                 break
 
-    # Fix #12: log final training metrics
     print(f"      Transformer training complete  best_loss={best_loss:.4f}")
     model.load_state_dict(best_state)
     return model
@@ -158,13 +182,15 @@ class MemmapDataset(Dataset):
         return torch.from_numpy(self._mm[real].copy())
 
 
-def _val_loss_memmap(model, loader, criterion, device) -> float:
+def _val_loss_memmap(model, loader, criterion, device,
+                     use_cuda: bool = False) -> float:
     model.eval()
     total = 0.0
     with torch.no_grad():
         for x in loader:
-            x = x.to(device)
-            total += criterion(model(x), x).item()
+            x = x.to(device, non_blocking=True)
+            with torch.amp.autocast("cuda", enabled=use_cuda):
+                total += criterion(model(x), x).item()
     return total / max(len(loader), 1)
 
 
@@ -196,12 +222,23 @@ def train_model_large(
     tr_idx = idx[n_val:]
     vl_idx = idx[:n_val] if n_val > 0 else None
 
-    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model     = model.to(device)
+    use_cuda = torch.cuda.is_available()
+    device   = torch.device("cuda" if use_cuda else "cpu")
+    model    = model.to(device)
+
+    # AMP: FP16 forward/backward on CUDA via Tensor Cores; no-op on CPU
+    scaler = torch.amp.GradScaler("cuda", enabled=use_cuda)
+
+    _loader_kw = dict(
+        num_workers        = 4 if use_cuda else 0,
+        pin_memory         = use_cuda,
+        persistent_workers = use_cuda,
+    )
+
     tr_ds     = MemmapDataset(seq_path, seq_shape, tr_idx)
     tr_loader = DataLoader(tr_ds, batch_size=batch_size, shuffle=True,
-                           num_workers=0, pin_memory=(device.type == "cuda"),
-                           generator=torch.Generator().manual_seed(RANDOM_SEED))
+                           generator=torch.Generator().manual_seed(RANDOM_SEED),
+                           **_loader_kw)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = _build_scheduler(optimizer, epochs, len(tr_loader))
     criterion = nn.MSELoss()
@@ -211,7 +248,7 @@ def train_model_large(
     if vl_idx is not None:
         vl_ds     = MemmapDataset(seq_path, seq_shape, vl_idx)
         vl_loader = DataLoader(vl_ds, batch_size=batch_size * 4,
-                               shuffle=False, num_workers=0)
+                               shuffle=False, **_loader_kw)
 
     n_train = len(tr_idx)
     print(f"      Training on {n_train:,} benign sequences "
@@ -226,20 +263,23 @@ def train_model_large(
         model.train()
         total = 0.0
         for x in tr_loader:
-            x = x.to(device)
+            x = x.to(device, non_blocking=True)
             optimizer.zero_grad()
-            loss = criterion(model(x), x)
-            loss.backward()
-            # Fix #10: gradient clipping to prevent exploding gradients
+            with torch.amp.autocast("cuda", enabled=use_cuda):
+                loss = criterion(model(x), x)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             total += loss.item()
         tr_loss = total / len(tr_loader)
 
         # ── validate ──────────────────────────────────────────────────────────
         if vl_loader is not None:
-            vl      = _val_loss_memmap(model, vl_loader, criterion, device)
+            vl      = _val_loss_memmap(model, vl_loader, criterion, device,
+                                       use_cuda=use_cuda)
             monitor = vl
             print(f"Epoch {epoch+1:>3}/{epochs}  train={tr_loss:.4f}  val={vl:.4f}")
         else:
