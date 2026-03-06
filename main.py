@@ -24,14 +24,17 @@ Full end-to-end pipeline:
     │       ▼
     │   rarity_scores              (N_events,)
     │
-    ├─► sequence_builder.py        sliding-window sequences
-    │       │                      small dataset → in-memory ndarray
-    │       │                      large dataset → np.memmap on disk
+    ├─► EventID filter [1, 3] only  ← transformer sees only high-signal types
+    │       │                          so it can distinguish attack vs benign
+    │       ▼  sequence_builder.py
+    │   sliding-window sequences   small → in-memory ndarray
+    │                              large → np.memmap on disk
+    │       │
     │       ▼  train.py            (val split + early stopping)
     │   TransformerAutoencoder     trained on benign sequences
     │       │
     │       ▼  evaluate.py         (batched inference)
-    │   reconstruction_errors      (N_sequences,)
+    │   reconstruction_errors      (N_seq_events,) → index-aligned → (N_events,)
     │
     ▼  anomaly_engine.py
   Composite anomaly scores         (N_events,)
@@ -58,6 +61,7 @@ from config import (
     LARGE_DATASET_THRESHOLD, SEQ_MEMMAP_PATH, LABELS_MEMMAP_PATH,
     INFER_BATCH_SIZE,
     RANDOM_SEED,
+    HIGH_SIGNAL_EVENTIDS,
 )
 from feature_engineering import feature_engineering
 from normaliser import fit_scaler, apply_scaler
@@ -165,13 +169,33 @@ def main():
     print(f"      mean rarity score: {event_rarity_scores.mean():.4f}")
 
     # ── 8. sequences + transformer autoencoder ────────────────────────────────
+    #
+    # WHY we filter here and not globally:
+    #   When trained on ALL event types, the transformer learns to reconstruct
+    #   benign module-loads, registry writes, and terminations — events that look
+    #   identical in attacks and normal operation.  The resulting model reconstructs
+    #   attack sequences just as well as benign ones → AUC ≈ 0.50 (non-discriminative).
+    #
+    #   EventID 1 (process creation) and 3 (network connection) carry the strongest
+    #   attack signal.  Restricting the transformer to these two types focuses its
+    #   anomaly signal exactly where attacks deviate from normal behaviour.
+    #
+    #   The GNN (steps 4-6) and rarity engine (step 7) intentionally keep all events:
+    #   they extract structural and frequency-based signals that benefit from full context.
+    #
     print(f"\n[8/9] Building sequences & training Transformer autoencoder...")
+    df["EventID"] = pd.to_numeric(df["EventID"], errors="coerce")
+    df_seq        = df[df["EventID"].isin(HIGH_SIGNAL_EVENTIDS)]
+    n_seq_events  = len(df_seq)
+    use_memmap_seq = n_seq_events > LARGE_DATASET_THRESHOLD
+    print(f"      EventID filter: {n_events:,} → {n_seq_events:,} rows "
+          f"(kept EventIDs {HIGH_SIGNAL_EVENTIDS})")
 
-    if use_memmap:
+    if use_memmap_seq:
         # ── large-dataset path ────────────────────────────────────────────────
         print(f"      Writing sequences to {SEQ_MEMMAP_PATH} ...")
         n_seq, seq_shape = build_sequences_memmap(
-            df, feature_cols, SEQUENCE_LENGTH,
+            df_seq, feature_cols, SEQUENCE_LENGTH,
             SEQ_MEMMAP_PATH, LABELS_MEMMAP_PATH,
         )
         print(f"      {n_seq:,} sequences of length {SEQUENCE_LENGTH} (on disk)")
@@ -192,14 +216,13 @@ def main():
 
         X_mm             = load_seq_memmap(SEQ_MEMMAP_PATH, seq_shape)
         seq_recon_errors = anomaly_scores(ta_model, X_mm, INFER_BATCH_SIZE)
-        n_seq_out        = n_seq
 
     else:
         # ── small-dataset path ────────────────────────────────────────────────
-        X, y = build_sequences(df, feature_cols, SEQUENCE_LENGTH)
+        X, y_s = build_sequences(df_seq, feature_cols, SEQUENCE_LENGTH)
         print(f"      {X.shape[0]:,} sequences of length {SEQUENCE_LENGTH}")
 
-        X_train = X[y == TRAIN_LABEL]
+        X_train = X[y_s == TRAIN_LABEL]
         print(f"      {X_train.shape[0]:,} benign training sequences")
 
         feature_dim = X.shape[2]
@@ -212,16 +235,23 @@ def main():
         print(f"      Saved -> {MODEL_PATH}")
 
         seq_recon_errors = anomaly_scores(ta_model, X, INFER_BATCH_SIZE)
-        n_seq_out        = len(X)
 
-    # Fix #4: align sequence-level scores back to events.
-    # Early events (before the first full window) get NaN instead of the
-    # first window's score to avoid artificially inflating their anomaly score.
-    event_recon_errors       = np.full(n_events, np.nan, dtype=np.float32)
-    pad                      = n_events - n_seq_out
-    event_recon_errors[pad:] = seq_recon_errors
+    # ── align sequence scores back to the full event array ────────────────────
+    #
+    # df_seq is a filtered subset of df.  Its .index values are original row
+    # positions in df (RangeIndex 0..n_events-1, never reset after filtering).
+    # Sequence i spans df_seq rows i..i+SEQUENCE_LENGTH-1, associated with the
+    # LAST event in the window: df_seq.index[i + SEQUENCE_LENGTH - 1].
+    # Events not in df_seq (non-1/3 EventIDs) and events before the first full
+    # window receive NaN — the anomaly engine treats NaN as 0 after normalising.
+    #
+    event_recon_errors = np.full(n_events, np.nan, dtype=np.float32)
+    n_seq              = len(seq_recon_errors)
+    last_event_idx     = df_seq.index[SEQUENCE_LENGTH - 1 : SEQUENCE_LENGTH - 1 + n_seq]
+    event_recon_errors[last_event_idx] = seq_recon_errors
+    n_valid = (~np.isnan(event_recon_errors)).sum()
     print(f"      mean recon error : {np.nanmean(event_recon_errors):.4f}  "
-          f"({pad} leading events set to NaN)")
+          f"({n_valid:,} events scored, {n_events - n_valid:,} set to NaN)")
 
     # ── 9. composite scores, alerts, evaluation ────────────────────────────────
     print("\n[9/9] Composite scoring, alerts & evaluation...")

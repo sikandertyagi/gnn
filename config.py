@@ -25,6 +25,17 @@ SCALER_PATH = "scaler.pkl"          # StandardScaler fitted on benign features o
 
 FEATURE_COLUMNS = []
 
+# ── transformer event filter ───────────────────────────────────────────────
+# Only EventID 1 (process creation) and 3 (network connection) carry strong
+# attack signal for the transformer autoencoder.  Using all event types dilutes
+# the training signal: the model learns to reconstruct benign module-loads,
+# registry writes, and terminations equally well — so attack sequences look no
+# different from benign ones (AUC ≈ 0.50).
+#
+# The GNN and rarity engine are NOT filtered — they benefit from the full
+# event graph (parent-child trees, user context, host behaviour).
+HIGH_SIGNAL_EVENTIDS = [1, 3]       # process creation + network connection
+
 # ── GNN encoder ────────────────────────────────────────────────────────────
 GNN_EMBED_DIM            = 64
 GNN_EPOCHS               = 15
