@@ -149,8 +149,9 @@ def train_gnn(
     Early stopping monitors training loss (GNN training is full-graph, so there
     is no separate val set; the loss itself is a reliable convergence signal).
     """
-    device    = torch.device("cpu")
+    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model     = model.to(device)
+    print(f"  GNN training on {device}")
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
 

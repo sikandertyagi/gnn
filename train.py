@@ -73,15 +73,16 @@ def train_model(
     X_tr   = X_shuffled[n_val:]
     X_val  = X_shuffled[:n_val] if n_val > 0 else None
 
-    device    = torch.device("cpu")
+    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model     = model.to(device)
     tr_ds     = TensorDataset(torch.from_numpy(X_tr).float())
     tr_loader = DataLoader(tr_ds, batch_size=batch_size, shuffle=True,
-                           num_workers=0, pin_memory=False,
+                           num_workers=0, pin_memory=(device.type == "cuda"),
                            generator=torch.Generator().manual_seed(RANDOM_SEED))
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = _build_scheduler(optimizer, epochs, len(tr_loader))
     criterion = nn.MSELoss()
+    print(f"      Transformer training on {device}")
 
     best_loss  = float("inf")
     best_state = copy.deepcopy(model.state_dict())
@@ -195,15 +196,16 @@ def train_model_large(
     tr_idx = idx[n_val:]
     vl_idx = idx[:n_val] if n_val > 0 else None
 
-    device    = torch.device("cpu")
+    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model     = model.to(device)
     tr_ds     = MemmapDataset(seq_path, seq_shape, tr_idx)
     tr_loader = DataLoader(tr_ds, batch_size=batch_size, shuffle=True,
-                           num_workers=0, pin_memory=False,
+                           num_workers=0, pin_memory=(device.type == "cuda"),
                            generator=torch.Generator().manual_seed(RANDOM_SEED))
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = _build_scheduler(optimizer, epochs, len(tr_loader))
     criterion = nn.MSELoss()
+    print(f"      Transformer (large) training on {device}")
 
     vl_loader = None
     if vl_idx is not None:

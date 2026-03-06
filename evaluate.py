@@ -28,7 +28,7 @@ def anomaly_scores(model, X, batch_size: int = 512) -> np.ndarray:
     -------
     scores : (N,) float32 ndarray  — MSE reconstruction error per sequence
     """
-    device = torch.device("cpu")
+    device = next(model.parameters()).device
     model.eval()
 
     scores = []
