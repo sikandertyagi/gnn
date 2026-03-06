@@ -1,6 +1,5 @@
 import torch
 import numpy as np
-from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import (
     roc_auc_score,
     average_precision_score,
@@ -13,26 +12,28 @@ from sklearn.metrics import (
 )
 
 
-def anomaly_scores(model, X, batch_size=256):
+def anomaly_scores(model, X, batch_size=2048):
     """Return per-sequence reconstruction MSE for all sequences in X."""
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.eval()
 
-    loader = DataLoader(
-        TensorDataset(torch.tensor(X).float()),
-        batch_size=batch_size, shuffle=False
-    )
-
-    scores = []
+    total   = len(X)
+    n_batch = (total + batch_size - 1) // batch_size
+    scores  = []
     with torch.no_grad():
-        for (x,) in loader:
-            x = x.to(device)
+        for i, start in enumerate(range(0, total, batch_size)):
+            chunk = np.array(X[start : start + batch_size], dtype=np.float32)
+            x     = torch.from_numpy(chunk).to(device)
             recon = model(x)
-            mse = torch.mean((x - recon) ** 2, dim=(1, 2))
-            scores.extend(mse.cpu().numpy())
+            mse   = torch.mean((x - recon) ** 2, dim=(1, 2))
+            scores.append(mse.cpu().numpy())
+            if (i + 1) % 50 == 0 or (i + 1) == n_batch:
+                print(f"\r  Scoring: {i+1}/{n_batch} batches "
+                      f"({100*(i+1)/n_batch:.1f}%)  ", end="", flush=True)
+    print()
 
-    return np.array(scores)
+    return np.concatenate(scores).astype(np.float32)
 
 
 def evaluate_metrics(scores, labels):
