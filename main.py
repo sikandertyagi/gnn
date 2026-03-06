@@ -66,8 +66,7 @@ from config import (
 from feature_engineering import feature_engineering
 from normaliser import fit_scaler, apply_scaler
 from graph_builder import build_event_graph, node_feature_dims
-from gnn_encoder import (HeteroGNNEncoder, train_gnn,
-                         compute_benign_centroids, graph_anomaly_scores)
+from gnn_encoder import (HeteroGNNEncoder, train_gnn, graph_anomaly_scores)
 from rarity_engine import RarityEngine
 from sequence_builder import (build_sequences, build_sequences_memmap,
                                load_seq_memmap, load_seq_labels)
@@ -149,12 +148,10 @@ def main():
     torch.save(gnn_model.state_dict(), GNN_MODEL_PATH)
     print(f"      Saved -> {GNN_MODEL_PATH}")
 
-    benign_centroids = compute_benign_centroids(gnn_model, benign_graph)
-
     # ── 6. per-event graph anomaly scores ─────────────────────────────────────
     print("\n[6/9] Computing graph anomaly scores...")
     proc_graph_scores = graph_anomaly_scores(
-        gnn_model, full_graph, benign_centroids, encoders["process"]
+        gnn_model, full_graph, encoders["process"]
     )
     proc_enc           = encoders["process"]
     event_images       = df["Image"].fillna("unknown").astype(str).values

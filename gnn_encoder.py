@@ -204,31 +204,17 @@ def train_gnn(
 # Inference helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_benign_centroids(model: HeteroGNNEncoder,
-                              data: HeteroData) -> dict:
-    """
-    Compute mean embedding per node type over the (benign) training graph.
-    Used as a reference point for anomaly scoring at inference time.
-    """
-    model.eval()
-    device = next(model.parameters()).device
-    x_dict = {ntype: data[ntype].x.to(device) for ntype in data.node_types}
-    edge_index_dict = {
-        etype: data[etype].edge_index.to(device)
-        for etype in data.edge_types
-    }
-    with torch.no_grad():
-        h = model.encode(x_dict, edge_index_dict)
-    return {ntype: emb.mean(dim=0) for ntype, emb in h.items()}
-
-
 def graph_anomaly_scores(model: HeteroGNNEncoder,
                           data: HeteroData,
-                          benign_centroids: dict,
                           process_enc) -> torch.Tensor:
     """
-    Per-process-node anomaly score = L2 distance from benign centroid,
-    normalised to [0, 1].
+    Per-process-node anomaly score = reconstruction MSE, normalised to [0, 1].
+
+    The GNN is trained to minimise reconstruction error on benign nodes, so
+    nodes whose neighbourhood deviates from normal (attack processes with
+    unusual parent-child chains or network connections) will produce high
+    reconstruction error at inference.  This is directly consistent with the
+    training objective; the previous centroid-distance approach was not.
 
     Returns
     -------
@@ -242,13 +228,14 @@ def graph_anomaly_scores(model: HeteroGNNEncoder,
         for etype in data.edge_types
     }
     with torch.no_grad():
-        h = model.encode(x_dict, edge_index_dict)
+        recon_dict = model(x_dict, edge_index_dict)   # encode + decode
 
-    proc_emb  = h["process"]
-    centroid  = benign_centroids["process"].to(device)
-    distances = torch.norm(proc_emb - centroid.unsqueeze(0), dim=1)
+    # per-node MSE for process nodes: shape (N_process,)
+    recon_err = F.mse_loss(
+        recon_dict["process"], x_dict["process"], reduction="none"
+    ).mean(dim=1)
 
     # normalise to [0, 1]
-    mn, mx = distances.min(), distances.max()
-    scores = (distances - mn) / (mx - mn + 1e-8)
+    mn, mx = recon_err.min(), recon_err.max()
+    scores = (recon_err - mn) / (mx - mn + 1e-8)
     return scores.cpu()
