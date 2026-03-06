@@ -85,4 +85,4 @@ SEQ_MEMMAP_PATH    = "sequences.dat"
 LABELS_MEMMAP_PATH = "seq_labels.dat"
 
 # Sequences processed per forward pass during inference
-INFER_BATCH_SIZE = 512
+INFER_BATCH_SIZE = 2048

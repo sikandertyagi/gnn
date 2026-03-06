@@ -31,9 +31,11 @@ def anomaly_scores(model, X, batch_size: int = 512) -> np.ndarray:
     device = next(model.parameters()).device
     model.eval()
 
-    scores = []
+    total   = len(X)
+    n_batch = (total + batch_size - 1) // batch_size
+    scores  = []
     with torch.no_grad():
-        for start in range(0, len(X), batch_size):
+        for i, start in enumerate(range(0, total, batch_size)):
             # np.array() materialises memmap slices into a contiguous buffer
             chunk = np.array(X[start : start + batch_size], dtype=np.float32)
             x     = torch.from_numpy(chunk).to(device)
@@ -41,5 +43,9 @@ def anomaly_scores(model, X, batch_size: int = 512) -> np.ndarray:
             # MSE averaged over time and feature dimensions → one scalar per seq
             mse   = torch.mean((x - recon) ** 2, dim=(1, 2))
             scores.append(mse.cpu().numpy())
+            if (i + 1) % 100 == 0 or (i + 1) == n_batch:
+                print(f"\r      Inference: {i+1}/{n_batch} batches "
+                      f"({100*(i+1)/n_batch:.1f}%)  ", end="", flush=True)
+    print()
 
     return np.concatenate(scores).astype(np.float32)
