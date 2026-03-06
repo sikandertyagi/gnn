@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Model / scaler artefacts
+*.pt
+*.pkl
+*.dat
+
+# Pipeline outputs
+*.csv
+*.json
