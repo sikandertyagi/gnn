@@ -40,7 +40,8 @@ import pandas as pd
 from collections import Counter
 
 from commandline_embedding import embed_commandlines
-from config import CMD_EMBED_N_COMPONENTS
+from process_chain_builder import build_process_chains, train_chain_w2v, chains_to_embeddings
+from config import CMD_EMBED_N_COMPONENTS, CHAIN_EMBED_DIM
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -211,6 +212,15 @@ def feature_engineering(df: pd.DataFrame):
     for i in range(CMD_EMBED_N_COMPONENTS):
         df[f"cmd_emb_{i}"] = _embs[:, i]
 
+    # ── process chain embeddings (Word2Vec on ancestry chains) ──────────────
+    # Build ancestry chains from ProcessGuid → ParentProcessGuid, train
+    # Word2Vec on the chains, then mean-pool each chain to a 32-d vector.
+    chains     = build_process_chains(df)
+    w2v        = train_chain_w2v(chains)
+    chain_embs = chains_to_embeddings(chains, w2v)  # (N, 32)
+    for i in range(CHAIN_EMBED_DIM):
+        df[f"chain_emb_{i}"] = chain_embs[:, i]
+
     # ── event type ────────────────────────────────────────────────────────────
     df["eventid"] = pd.to_numeric(
         df["EventID"].fillna(0), errors="coerce"
@@ -279,6 +289,8 @@ def feature_engineering(df: pd.DataFrame):
         "hour",
         "is_after_hours",
         "eventid",
+        # process chain embeddings: Word2Vec-32 mean-pooled (z-scored)
+        *[f"chain_emb_{i}" for i in range(CHAIN_EMBED_DIM)],
     ]
 
     return df, feature_cols

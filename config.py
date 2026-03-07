@@ -100,3 +100,11 @@ CMD_EMBED_BATCH_SIZE   = 256
 CMD_EMBED_CACHE_DIR    = ".cmd_embed_cache"
 # Path to the fitted PCA model (joblib); created on first run, reused after.
 CMD_EMBED_PCA_PATH     = "cmd_pca.pkl"
+
+# ── process chain embeddings ─────────────────────────────────────────────
+# Word2Vec trained on process ancestry chains (ProcessGuid → ParentProcessGuid).
+CHAIN_EMBED_DIM       = 32          # Word2Vec vector_size
+CHAIN_MAX_DEPTH       = 4           # max ancestors to walk per event
+CHAIN_W2V_WINDOW      = 4           # Word2Vec context window
+CHAIN_W2V_MIN_COUNT   = 5           # minimum frequency to keep a process name
+CHAIN_W2V_MODEL_PATH  = "chain_w2v.model"  # saved gensim Word2Vec model

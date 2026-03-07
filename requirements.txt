@@ -5,3 +5,4 @@ torch>=2.0.0
 torch-geometric>=2.3.0
 networkx>=3.0
 sentence-transformers>=2.2.0
+gensim>=4.3.0
