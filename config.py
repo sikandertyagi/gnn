@@ -88,3 +88,15 @@ LABELS_MEMMAP_PATH = "seq_labels.dat"
 
 # Sequences processed per forward pass during inference
 INFER_BATCH_SIZE = 2048
+
+# ── semantic command-line embeddings ───────────────────────────────────────────
+# SentenceTransformer model: 384-d output, ~22 M params, CPU-friendly.
+CMD_EMBED_MODEL        = "all-MiniLM-L6-v2"
+# PCA target dimensionality (384 → 32).
+CMD_EMBED_N_COMPONENTS = 32
+# Sentences encoded per forward pass; 256 balances throughput vs peak RAM.
+CMD_EMBED_BATCH_SIZE   = 256
+# Directory for SHA-256 keyed raw-embedding cache files (.npy).
+CMD_EMBED_CACHE_DIR    = ".cmd_embed_cache"
+# Path to the fitted PCA model (joblib); created on first run, reused after.
+CMD_EMBED_PCA_PATH     = "cmd_pca.pkl"

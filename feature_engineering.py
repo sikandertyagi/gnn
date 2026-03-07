@@ -39,6 +39,9 @@ import numpy as np
 import pandas as pd
 from collections import Counter
 
+from commandline_embedding import embed_commandlines
+from config import CMD_EMBED_N_COMPONENTS
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Optional Sysmon columns and their safe defaults (None → leave as NaN)
@@ -197,6 +200,17 @@ def feature_engineering(df: pd.DataFrame):
     # Shannon entropy via optimised Python function (unavoidably per-row)
     df["cmd_entropy"] = cmd.apply(_entropy)
 
+    # ── semantic command-line embeddings (SentenceTransformer + PCA) ──────────
+    # all-MiniLM-L6-v2 encodes the full command string to 384-d; PCA reduces to
+    # CMD_EMBED_N_COMPONENTS (32) dimensions.  Captures semantic similarity
+    # between commands (e.g. different but functionally equivalent PowerShell
+    # one-liners) that handcrafted binary flags miss entirely.
+    # Results are cached on disk keyed by a SHA-256 hash of the input series so
+    # repeated pipeline runs do not re-encode the same dataset.
+    _embs = embed_commandlines(df["CommandLine"].fillna("").astype(str))  # (N, 32)
+    for i in range(CMD_EMBED_N_COMPONENTS):
+        df[f"cmd_emb_{i}"] = _embs[:, i]
+
     # ── event type ────────────────────────────────────────────────────────────
     df["eventid"] = pd.to_numeric(
         df["EventID"].fillna(0), errors="coerce"
@@ -252,6 +266,8 @@ def feature_engineering(df: pd.DataFrame):
         "has_download",
         "has_encodedcommand",
         "cmd_entropy",
+        # semantic command-line embeddings: PCA-32 of all-MiniLM-L6-v2 (z-scored)
+        *[f"cmd_emb_{i}" for i in range(CMD_EMBED_N_COMPONENTS)],
         "path_depth",
         "is_system32",
         "is_users_dir",
