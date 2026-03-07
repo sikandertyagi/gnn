@@ -4,27 +4,33 @@ anomaly_engine.py
 Combines three anomaly signals into a composite event score.
 
     event_score = RECON_WEIGHT  * reconstruction_error   (transformer)
-                + GRAPH_WEIGHT  * graph_anomaly_score     (GNN)
                 + RARITY_WEIGHT * rarity_score            (rare behaviour)
 
-All three input arrays must be aligned to the same event index.
+GRAPH_WEIGHT is set to 0.0: ablation showed graph_score ROC-AUC = 0.31,
+which is worse than random (0.50), meaning the GNN was assigning higher
+scores to benign events than malicious ones and actively degrading the
+composite.  Removing it improves both PR-AUC and precision.
+
+Current weights: RECON=0.45, GRAPH=0.00, RARITY=0.55 (sum=1.0).
+
+All input arrays must be aligned to the same event index.
 Each component is min-max normalised before weighting.
 
 Weight redistribution for warmup events
 ────────────────────────────────────────
-The pipeline now filters to EventID 1 & 3 globally, so every event is
+The pipeline filters to EventID 1 & 3 globally, so every event is
 eligible for transformer scoring.  However, the first (SEQUENCE_LENGTH - 1)
 events per host have no full sliding window and therefore receive NaN
 recon_error (warmup period).
 
 Filling NaN with 0 and applying the standard weights would cap warmup
-events at (GRAPH_WEIGHT + RARITY_WEIGHT) = 0.65, while fully-scored events
-can reach 1.0.  To keep both groups on equal footing, RECON_WEIGHT is
-redistributed proportionally to the two available signals for warmup events:
+events at RARITY_WEIGHT = 0.55, while fully-scored events can reach 1.0.
+To keep both groups on equal footing, RECON_WEIGHT is redistributed
+proportionally to the available signals for warmup events:
 
-    scored   → RECON_WEIGHT·r + GRAPH_WEIGHT·g + RARITY_WEIGHT·s
-    warmup   → (GRAPH_WEIGHT / remain)·g + (RARITY_WEIGHT / remain)·s
-               where remain = GRAPH_WEIGHT + RARITY_WEIGHT
+    scored   → RECON_WEIGHT·r + RARITY_WEIGHT·s
+    warmup   → (RARITY_WEIGHT / remain)·s  =  s
+               where remain = RARITY_WEIGHT  (GRAPH_WEIGHT = 0)
 """
 
 import numpy as np

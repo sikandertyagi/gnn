@@ -15,7 +15,7 @@ LEARNING_RATE = 1e-3
 VAL_RATIO               = 0.15
 EARLY_STOPPING_PATIENCE = 5         # epochs without val-loss improvement → stop
 
-EMBED_DIM  = 128
+EMBED_DIM  = 96
 NUM_HEADS  = 4
 NUM_LAYERS = 2
 FF_DIM     = 256
@@ -57,9 +57,9 @@ GNN_EARLY_STOPPING_PAT   = 5        # patience for GNN training
 #   rarity_score  AUC = 0.9717  (old; expected similar)
 #   graph_score   AUC = 0.7011  (old; expected similar)
 #   recon_error   AUC ≈ 0.50    (old; expected much higher after fixes)
-RECON_WEIGHT  = 0.35        # transformer reconstruction error (re-derive after fixes)
-GRAPH_WEIGHT  = 0.25        # GNN graph anomaly score
-RARITY_WEIGHT = 0.40        # rare behaviour score
+RECON_WEIGHT  = 0.45        # transformer reconstruction error
+GRAPH_WEIGHT  = 0.00        # GNN graph anomaly score (disabled: ablation AUC=0.31 < random)
+RARITY_WEIGHT = 0.55        # rare behaviour score
 
 # ── alert aggregation ─────────────────────────────────────────────────────
 # Previous value (0.6) was above the attack score ceiling (~0.29 with old

@@ -97,6 +97,10 @@ class TransformerAutoencoder(nn.Module):
             dim_feedforward=ff_dim, batch_first=True, dropout=dropout,
         )
         self.decoder_transformer = nn.TransformerDecoder(dec_layer, num_layers=num_layers)
+        # Projects positional query tokens before cross-attention; forces the
+        # decoder to learn a dedicated query space rather than attending directly
+        # with raw sinusoidal embeddings, improving reconstruction specificity.
+        self.query_proj  = nn.Linear(embed_dim, embed_dim)
         self.output_proj = nn.Linear(embed_dim, feature_dim)
 
     # ── public API ────────────────────────────────────────────────────────────
@@ -112,10 +116,11 @@ class TransformerAutoencoder(nn.Module):
         """(B, bottleneck_dim) → (B, T, F)."""
         # expand bottleneck back to embed_dim; broadcast over time steps
         memory = self.bottleneck_expand(z).unsqueeze(1).expand(-1, seq_len, -1)
-        # positional query tokens for the decoder
+        # positional query tokens for the decoder, projected to query space
         tgt = self.pos_enc(
             torch.zeros(z.size(0), seq_len, self.embed_dim, device=z.device)
         )
+        tgt = self.query_proj(tgt)
         h = self.decoder_transformer(tgt, memory)
         return self.output_proj(h)
 
