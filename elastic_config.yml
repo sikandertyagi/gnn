@@ -24,23 +24,34 @@ page_size: 5000
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. DATA SOURCES
+# 2. DATA SOURCES  ← THE ONLY FLAG YOU NEED TO CHANGE
 # ─────────────────────────────────────────────────────────────────────────────
-# Valid values: "sysmon", "defend", "wazuh"
-# List only what is actually deployed in your environment.
 #
-#  sysmon  → Sysmon events via Winlogbeat or Elastic Agent
-#  defend  → Elastic Defend endpoint agent
-#  wazuh   → Wazuh alerts forwarded to Elasticsearch
+# Uncomment exactly ONE of the three presets below.
 #
-# If Elastic Defend and Sysmon both run on the same hosts the connector
-# deduplicates by (host, timestamp, image, eventid) automatically.
+# OPTION A — Elastic Defend only  (current)
 sources:
-  - sysmon
   - defend
-  # - wazuh
 
-# Index patterns ──────────────────────────────────────────────────────────────
+# OPTION B — Wazuh Sysmon only
+# sources:
+#   - wazuh
+
+# OPTION C — Both (Elastic Defend + Wazuh Sysmon)
+# sources:
+#   - defend
+#   - wazuh
+#
+# ── Notes ─────────────────────────────────────────────────────────────────────
+#  defend  → Elastic Defend endpoint agent (ECS fields: process.*, destination.*)
+#  wazuh   → Sysmon events forwarded via Wazuh (data.win.eventdata.* fields)
+#  sysmon  → Sysmon events via Winlogbeat / Elastic Agent (winlog.event_data.*)
+#            Add "- sysmon" to any preset above if you have Winlogbeat as well.
+#
+#  When multiple sources cover the same hosts the connector deduplicates by
+#  (host, timestamp, image, eventid) so events are never double-counted.
+
+# Index patterns — adjust if your cluster uses non-default index names ─────────
 sysmon_index:  "winlogbeat-*,logs-windows.sysmon_operational-*"
 defend_index:  "logs-endpoint.events.process-*,logs-endpoint.events.network-*"
 wazuh_index:   "wazuh-alerts-4.x-*,wazuh-archives-4.x-*"
