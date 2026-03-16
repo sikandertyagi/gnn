@@ -47,6 +47,7 @@ Full end-to-end pipeline:
   JSON + ROC/PR curve CSVs + threshold sweep table
 """
 
+import os
 import random
 
 import numpy as np
@@ -54,6 +55,7 @@ import pandas as pd
 import torch
 
 from config import (
+    DATA_DIR, ARTIFACTS_DIR,
     DATA_PATH, SEQUENCE_LENGTH, TRAIN_LABEL,
     EPOCHS, BATCH_SIZE, LEARNING_RATE, VAL_RATIO, EARLY_STOPPING_PATIENCE,
     GNN_EPOCHS, GNN_LR,
@@ -97,6 +99,12 @@ def _set_seeds(seed: int):
 def main():
 
     _set_seeds(RANDOM_SEED)
+
+    # ── ensure output directories exist ───────────────────────────────────────
+    os.makedirs(DATA_DIR,      exist_ok=True)
+    os.makedirs(ARTIFACTS_DIR, exist_ok=True)
+    print(f"      Data dir      : {DATA_DIR}")
+    print(f"      Artifacts dir : {ARTIFACTS_DIR}")
 
     # ── 1. load data ──────────────────────────────────────────────────────────
     print("\n[1/9] Loading dataset...")

@@ -90,5 +90,5 @@ eval_end:    "2026-01-31T23:59:59Z"
 # 4. OUTPUT
 # ─────────────────────────────────────────────────────────────────────────────
 # Path for the merged CSV written by elastic_ingest.py.
-# After ingestion update DATA_PATH in config.py to match, then run main.py.
-output_path: "elastic_data.csv"
+# Matches DATA_PATH in config.py — both point to the large-capacity data volume.
+output_path: "/gulshan_data/anomaly_detection/elastic_data.csv"
