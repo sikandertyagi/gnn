@@ -322,7 +322,7 @@ class ElasticConnector:
             "size": self._page_size,
             "sort": [
                 {"@timestamp": {"order": "asc"}},
-                {"_id":        {"order": "asc"}},
+                {"_shard_doc": "asc"},          # recommended tiebreaker; _id sort breaks on large data-stream indices
             ],
         }
         search_after = None
