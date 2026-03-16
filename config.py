@@ -74,7 +74,21 @@ ALERT_WINDOW    = 300       # seconds: max gap to chain consecutive alerts
 ALERTS_PATH     = "alerts.csv"
 SCORES_PATH     = "anomaly_scores.csv"
 
-# ── evaluation output (research-paper artefacts) ──────────────────────────
+# ── ground-truth availability ─────────────────────────────────────────────
+# Set True only when the dataset contains manually verified Label=1 events
+# (confirmed attacks).  When False the pipeline skips AUC/F1/ROC metrics
+# (which are meaningless without ground truth) and instead writes a
+# human-readable investigation report for manual triage.
+HAS_GROUND_TRUTH = False
+
+# ── investigation report (written when HAS_GROUND_TRUTH = False) ──────────
+# anomaly_report.txt  — narrative triage report grouped by host / alert chain
+# flagged_events.csv  — all flagged event rows with full context fields,
+#                       sorted by anomaly score for spreadsheet review
+ANOMALY_REPORT_PATH  = "anomaly_report.txt"
+FLAGGED_EVENTS_PATH  = "flagged_events.csv"
+
+# ── evaluation output (research-paper artefacts, HAS_GROUND_TRUTH = True) ─
 METRICS_JSON_PATH = "metrics.json"  # all scalar metrics; import directly into paper tables
 ROC_CURVE_PATH    = "roc_curve.csv"  # fpr / tpr / threshold columns → Figure: ROC curve
 PR_CURVE_PATH     = "pr_curve.csv"   # precision / recall / threshold  → Figure: PR curve

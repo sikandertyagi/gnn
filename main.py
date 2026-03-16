@@ -63,6 +63,8 @@ from config import (
     INFER_BATCH_SIZE,
     RANDOM_SEED,
     HIGH_SIGNAL_EVENTIDS,
+    HAS_GROUND_TRUTH,
+    ANOMALY_REPORT_PATH, FLAGGED_EVENTS_PATH,
 )
 from feature_engineering import feature_engineering
 from normaliser import fit_scaler, apply_scaler
@@ -77,6 +79,7 @@ from evaluate import anomaly_scores
 from anomaly_engine import compute_anomaly_scores
 from alert_aggregator import aggregate_alerts
 from metrics import evaluate
+from anomaly_report import generate_investigation_report
 
 
 def _set_seeds(seed: int):
@@ -287,7 +290,25 @@ def main():
             ["chain_id", "num_events", "max_score", "processes", "dest_ips"]
         ].to_string(index=False))
 
-    # only run metrics if we have labelled data
+    # ── investigation report (always generated) ───────────────────────────────
+    # Written regardless of whether ground truth is available.
+    # anomaly_report.txt  → narrative triage report for manual review
+    # flagged_events.csv  → all flagged rows with full context for spreadsheet
+    generate_investigation_report(
+        df_scores   = df_scores,
+        df_events   = df,
+        df_alerts   = alerts,
+        report_path = ANOMALY_REPORT_PATH,
+        csv_path    = FLAGGED_EVENTS_PATH,
+    )
+
+    # ── skip AUC / F1 when no ground-truth labels exist ───────────────────────
+    if not HAS_GROUND_TRUTH:
+        print("\n  HAS_GROUND_TRUTH=False — AUC/F1 metrics skipped.")
+        print(f"  Review {ANOMALY_REPORT_PATH} and {FLAGGED_EVENTS_PATH} "
+              "for manual triage.")
+        return
+
     has_labels = df_scores["label"].nunique() > 1
     if not has_labels:
         print("\n  No anomalous labels found — skipping evaluation metrics.")

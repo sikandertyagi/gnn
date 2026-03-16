@@ -9,82 +9,68 @@
 # 1. ELASTICSEARCH CONNECTION
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Option A: Self-hosted / on-prem cluster
-host: "https://your-elastic-host:9200"
+# Self-hosted cluster over plain HTTP
+host: "http://your-elastic-host:9200"
 
-# Option B: Elastic Cloud (comment out 'host' and uncomment cloud_id)
-# cloud_id: "my-deployment:dXMtZWFzdC0xLmF3cy5mb3VuZC5pbyQ..."
+# Username / password auth
+username: "elastic"
+password: "changeme"
 
-# ── Authentication (choose ONE) ───────────────────────────────────────────────
+# TLS verification — set false for plain HTTP or self-signed certs
+verify_certs: false
 
-# Method 1: API Key  (recommended — least-privilege, easy to rotate)
-# Create in Kibana: Stack Management → API Keys → Create API key
-# Required privileges: read on target indices
-api_key: "YOUR_BASE64_API_KEY_HERE"
-
-# Method 2: Username / password (basic auth)
-# username: "elastic"
-# password: "changeme"
-
-# ── TLS ───────────────────────────────────────────────────────────────────────
-
-# Path to CA certificate (for self-signed or internal PKI certs)
-# ca_certs: "/etc/ssl/certs/elastic-ca.crt"
-
-# Set to false ONLY in dev/lab environments with self-signed certs
-verify_certs: true
-
-# ── Pagination ────────────────────────────────────────────────────────────────
-# Hits per search_after page. Reduce to 1000–2000 for slow/small clusters.
+# Pagination: hits per search_after page (reduce to 1000 on slow clusters)
 page_size: 5000
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. DATA SOURCES
 # ─────────────────────────────────────────────────────────────────────────────
-# List which sources to query. Valid values: "sysmon", "defend", "wazuh"
-# Use only what is deployed in your environment.
+# Valid values: "sysmon", "defend", "wazuh"
+# List only what is actually deployed in your environment.
 #
 #  sysmon  → Sysmon events via Winlogbeat or Elastic Agent
-#            (winlog.event_data.* field layout)
 #  defend  → Elastic Defend endpoint agent
-#            (ECS field layout: process.*, destination.*, user.*, host.*)
-#  wazuh   → Wazuh alerts / archives forwarded to Elasticsearch
-#            (data.win.eventdata.* field layout — Wazuh 3.x–4.x)
+#  wazuh   → Wazuh alerts forwarded to Elasticsearch
 #
-# If you have duplicate coverage (e.g. both Elastic Defend and Sysmon on the
-# same hosts), the connector deduplicates by (host, timestamp, image, eventid).
+# If Elastic Defend and Sysmon both run on the same hosts the connector
+# deduplicates by (host, timestamp, image, eventid) automatically.
 sources:
   - sysmon
   - defend
-  # - wazuh   # uncomment if Wazuh is forwarding to your Elasticsearch
+  # - wazuh
 
-# ── Index patterns ────────────────────────────────────────────────────────────
-
-# Sysmon via Winlogbeat / Elastic Agent
-sysmon_index: "winlogbeat-*,logs-windows.sysmon_operational-*"
-
-# Elastic Defend endpoint events
-defend_index: "logs-endpoint.events.process-*,logs-endpoint.events.network-*"
-
-# Wazuh (only used if "wazuh" is listed in sources above)
-wazuh_index: "wazuh-alerts-4.x-*,wazuh-archives-4.x-*"
+# Index patterns ──────────────────────────────────────────────────────────────
+sysmon_index:  "winlogbeat-*,logs-windows.sysmon_operational-*"
+defend_index:  "logs-endpoint.events.process-*,logs-endpoint.events.network-*"
+wazuh_index:   "wazuh-alerts-4.x-*,wazuh-archives-4.x-*"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. DATE WINDOWS
 # ─────────────────────────────────────────────────────────────────────────────
-# Training window  → Label = 0  (benign baseline)
-#   All three models (GNN, Rarity, Transformer) train ONLY on this data.
-#   Assumption: endpoint behaviour Nov–Dec 2025 is predominantly benign.
+#
+# TRAINING window (Nov–Dec 2025)
+#   Assumption: endpoint activity in this period is predominantly benign.
+#   All three models (GNN encoder, Rarity engine, Transformer autoencoder)
+#   are trained exclusively on this data.
+#   In the output CSV these events are assigned an INTERNAL marker Label=0.
+#   This is NOT a ground-truth annotation — it simply tells the pipeline
+#   "train on these rows".
+#
 train_start: "2025-11-01T00:00:00Z"
 train_end:   "2025-12-31T23:59:59Z"
 
-# Evaluation window → Label = 2  (suspicious / unknown)
-#   Pipeline scores every event here but never trains on it.
-#   Labels {1, 2} are treated as "positive" by the metrics module.
-#   Use relabel_anomalies.py to promote specific events to Label=1
-#   once you have confirmed ground truth (required for AUC/F1 to be meaningful).
+# EVALUATION window (Jan 2026)
+#   No ground-truth labels exist.  The pipeline scores every event in this
+#   window against the Nov–Dec baseline.  A small fraction are expected to be
+#   anomalous; the rest are still benign.
+#   In the output CSV these events are assigned an INTERNAL marker Label=2.
+#   Label=2 means "evaluation period — do not train on, but score".
+#   The pipeline NEVER uses Label=2 rows for training.
+#   Anomalies found here are written to anomaly_report.txt and
+#   flagged_events.csv for your manual verification.
+#
 eval_start:  "2026-01-01T00:00:00Z"
 eval_end:    "2026-01-31T23:59:59Z"
 
@@ -92,6 +78,6 @@ eval_end:    "2026-01-31T23:59:59Z"
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. OUTPUT
 # ─────────────────────────────────────────────────────────────────────────────
-# Path for the merged CSV.  After ingestion, update DATA_PATH in config.py
-# to match this value, then run:  python main.py
+# Path for the merged CSV written by elastic_ingest.py.
+# After ingestion update DATA_PATH in config.py to match, then run main.py.
 output_path: "elastic_data.csv"
