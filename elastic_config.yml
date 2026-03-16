@@ -1,0 +1,97 @@
+# elastic_config.yml
+# ──────────────────
+# Configuration for elastic_ingest.py — pulls Elastic SIEM data and
+# prepares the CSV that main.py (the GNN anomaly pipeline) consumes.
+#
+# All values can be overridden by environment variables (see elastic_ingest.py).
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. ELASTICSEARCH CONNECTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Option A: Self-hosted / on-prem cluster
+host: "https://your-elastic-host:9200"
+
+# Option B: Elastic Cloud (comment out 'host' and uncomment cloud_id)
+# cloud_id: "my-deployment:dXMtZWFzdC0xLmF3cy5mb3VuZC5pbyQ..."
+
+# ── Authentication (choose ONE) ───────────────────────────────────────────────
+
+# Method 1: API Key  (recommended — least-privilege, easy to rotate)
+# Create in Kibana: Stack Management → API Keys → Create API key
+# Required privileges: read on target indices
+api_key: "YOUR_BASE64_API_KEY_HERE"
+
+# Method 2: Username / password (basic auth)
+# username: "elastic"
+# password: "changeme"
+
+# ── TLS ───────────────────────────────────────────────────────────────────────
+
+# Path to CA certificate (for self-signed or internal PKI certs)
+# ca_certs: "/etc/ssl/certs/elastic-ca.crt"
+
+# Set to false ONLY in dev/lab environments with self-signed certs
+verify_certs: true
+
+# ── Pagination ────────────────────────────────────────────────────────────────
+# Hits per search_after page. Reduce to 1000–2000 for slow/small clusters.
+page_size: 5000
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. DATA SOURCES
+# ─────────────────────────────────────────────────────────────────────────────
+# List which sources to query. Valid values: "sysmon", "defend", "wazuh"
+# Use only what is deployed in your environment.
+#
+#  sysmon  → Sysmon events via Winlogbeat or Elastic Agent
+#            (winlog.event_data.* field layout)
+#  defend  → Elastic Defend endpoint agent
+#            (ECS field layout: process.*, destination.*, user.*, host.*)
+#  wazuh   → Wazuh alerts / archives forwarded to Elasticsearch
+#            (data.win.eventdata.* field layout — Wazuh 3.x–4.x)
+#
+# If you have duplicate coverage (e.g. both Elastic Defend and Sysmon on the
+# same hosts), the connector deduplicates by (host, timestamp, image, eventid).
+sources:
+  - sysmon
+  - defend
+  # - wazuh   # uncomment if Wazuh is forwarding to your Elasticsearch
+
+# ── Index patterns ────────────────────────────────────────────────────────────
+
+# Sysmon via Winlogbeat / Elastic Agent
+sysmon_index: "winlogbeat-*,logs-windows.sysmon_operational-*"
+
+# Elastic Defend endpoint events
+defend_index: "logs-endpoint.events.process-*,logs-endpoint.events.network-*"
+
+# Wazuh (only used if "wazuh" is listed in sources above)
+wazuh_index: "wazuh-alerts-4.x-*,wazuh-archives-4.x-*"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. DATE WINDOWS
+# ─────────────────────────────────────────────────────────────────────────────
+# Training window  → Label = 0  (benign baseline)
+#   All three models (GNN, Rarity, Transformer) train ONLY on this data.
+#   Assumption: endpoint behaviour Nov–Dec 2025 is predominantly benign.
+train_start: "2025-11-01T00:00:00Z"
+train_end:   "2025-12-31T23:59:59Z"
+
+# Evaluation window → Label = 2  (suspicious / unknown)
+#   Pipeline scores every event here but never trains on it.
+#   Labels {1, 2} are treated as "positive" by the metrics module.
+#   Use relabel_anomalies.py to promote specific events to Label=1
+#   once you have confirmed ground truth (required for AUC/F1 to be meaningful).
+eval_start:  "2026-01-01T00:00:00Z"
+eval_end:    "2026-01-31T23:59:59Z"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. OUTPUT
+# ─────────────────────────────────────────────────────────────────────────────
+# Path for the merged CSV.  After ingestion, update DATA_PATH in config.py
+# to match this value, then run:  python main.py
+output_path: "elastic_data.csv"

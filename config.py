@@ -1,3 +1,6 @@
+# ── data source ────────────────────────────────────────────────────────────
+# Change to "elastic_data.csv" after running elastic_ingest.py, or pass the
+# output_path you set in elastic_config.yml.
 DATA_PATH = "sysmondataless.csv"
 
 # ── reproducibility ────────────────────────────────────────────────────────
