@@ -35,6 +35,7 @@ Performance
 """
 
 import os
+import re
 from multiprocessing import cpu_count
 
 import numpy as np
@@ -55,10 +56,10 @@ from config import (
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _extract_basename(path) -> str:
-    """Lowercase executable name from a Windows image path."""
+    """Lowercase executable name from a Windows or Linux image path."""
     if pd.isna(path) or not str(path).strip():
         return "unknown"
-    return str(path).strip().split("\\")[-1].lower()
+    return re.split(r"[/\\]", str(path).strip())[-1].lower()
 
 
 def build_process_chains(

@@ -12,6 +12,8 @@ Algorithm
 4. Summarise each chain (processes involved, destination IPs, score stats).
 """
 
+import re
+
 import numpy as np
 import pandas as pd
 
@@ -103,7 +105,7 @@ def _summarise(chain_id: int, rows: list, host: str = "") -> dict:
     scores = [float(r["_score"]) for r in rows]
 
     processes = list(dict.fromkeys(
-        str(r.get("Image", "unknown")).split("\\")[-1].lower()
+        re.split(r"[/\\]", str(r.get("Image", "unknown")))[-1].lower()
         for r in rows
     ))
 

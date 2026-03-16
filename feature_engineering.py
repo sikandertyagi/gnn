@@ -133,10 +133,10 @@ def _has_encodedcommand(cmd: pd.Series) -> pd.Series:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_process_name(path) -> str:
-    """Return lowercased filename from a Windows path string."""
+    """Return lowercased filename from a Windows or Linux path string."""
     if pd.isna(path):
         return "unknown"
-    return str(path).split("\\")[-1].lower()
+    return re.split(r"[/\\]", str(path))[-1].lower()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -163,11 +163,11 @@ def feature_engineering(df: pd.DataFrame):
     # ── process name features (vectorised str ops) ────────────────────────────
     df["process_name"] = (
         df["Image"].fillna("unknown").astype(str)
-        .str.split("\\").str[-1].str.lower()
+        .str.split(r"[/\\]").str[-1].str.lower()
     )
     df["parent_process"] = (
         df["ParentImage"].fillna("unknown").astype(str)
-        .str.split("\\").str[-1].str.lower()
+        .str.split(r"[/\\]").str[-1].str.lower()
     )
     df["parent_child"] = df["parent_process"] + "->" + df["process_name"]
 
@@ -229,7 +229,7 @@ def feature_engineering(df: pd.DataFrame):
     # ── path features (vectorised) ────────────────────────────────────────────
     img = df["Image"].fillna("").astype(str)
 
-    df["path_depth"]   = img.str.count(r"\\")
+    df["path_depth"]   = img.str.count(r"[/\\]")
     df["is_system32"]  = img.str.contains("system32", case=False, na=False).astype(int)
     df["is_users_dir"] = img.str.contains("users",    case=False, na=False).astype(int)
     df["is_temp_exec"] = img.str.contains("temp",     case=False, na=False).astype(int)

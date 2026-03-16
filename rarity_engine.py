@@ -17,6 +17,8 @@ Scalability
   score_row()      – kept for single-event use (e.g. streaming)
 """
 
+import re
+
 import numpy as np
 import pandas as pd
 
@@ -145,5 +147,5 @@ class RarityEngine:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _extract_name(series: pd.Series) -> pd.Series:
-    """Vectorised equivalent of  str(path).split('\\')[-1].lower()."""
-    return series.astype(str).str.split("\\").str[-1].str.lower()
+    """Vectorised basename extraction for Windows and Linux paths."""
+    return series.astype(str).str.split(r"[/\\]").str[-1].str.lower()

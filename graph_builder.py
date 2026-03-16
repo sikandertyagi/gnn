@@ -154,7 +154,7 @@ def _process_features(df: pd.DataFrame, enc: LabelEncoder) -> torch.Tensor:
     )
 
     # Fix #6: normalize continuous features to [0, 1]
-    path_depth = images.apply(lambda x: float(str(x).count("\\")))
+    path_depth = images.apply(lambda x: float(len(re.split(r"[/\\]", str(x))) - 1))
     path_depth = (path_depth / path_depth.clip(lower=1).max()).fillna(0.0)
 
     is_sys32 = images.str.contains("system32", case=False, na=False).astype(float)
