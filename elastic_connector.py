@@ -332,7 +332,7 @@ class ElasticConnector:
             if search_after:
                 body["search_after"] = search_after
 
-            resp = self._es.search(index=index, body=body)
+            resp = self._es.search(index=index, body=body, expand_wildcards="all")
             hits = resp["hits"]["hits"]
             if not hits:
                 break

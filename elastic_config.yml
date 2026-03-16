@@ -53,7 +53,7 @@ sources:
 
 # Index patterns — adjust if your cluster uses non-default index names ─────────
 sysmon_index:  "winlogbeat-*,logs-windows.sysmon_operational-*"
-defend_index:  "logs-endpoint.events.process-*,logs-endpoint.events.network-*,Restored_.ds-logs-endpoint.events.process-*,Restored_.ds-logs-endpoint.events.network-*"
+defend_index:  "logs-endpoint.events.process-*,logs-endpoint.events.network-*,.ds-logs-endpoint.events.process-*,.ds-logs-endpoint.events.network-*"
 wazuh_index:   "wazuh-alerts-4.x-*,wazuh-archives-4.x-*"
 
 
