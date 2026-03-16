@@ -9,8 +9,8 @@
 # 1. ELASTICSEARCH CONNECTION
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Self-hosted cluster over plain HTTP
-host: "http://your-elastic-host:9200"
+# Self-hosted cluster over HTTPS (cert verification disabled)
+host: "https://your-elastic-host:9200"
 
 # Username / password auth
 username: "elastic"

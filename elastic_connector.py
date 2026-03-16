@@ -274,7 +274,16 @@ class ElasticConnector:
                 "pip install 'elasticsearch>=8.0.0,<9.0.0'"
             ) from exc
 
-        kwargs: Dict[str, Any] = {"verify_certs": verify_certs}
+        # Suppress urllib3 InsecureRequestWarning when cert verification is
+        # disabled — without this every paginated request prints a warning.
+        if not verify_certs:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        kwargs: Dict[str, Any] = {
+            "verify_certs":  verify_certs,
+            "ssl_show_warn": verify_certs,   # mirror: False hides ES-client SSL logs
+        }
 
         if cloud_id:
             kwargs["cloud_id"] = cloud_id
