@@ -431,6 +431,67 @@ class ElasticConnector:
             }
         }
 
+    # ── streaming chunk iterators ─────────────────────────────────────────────
+    def iter_sysmon_chunks(
+        self,
+        start: str,
+        end: str,
+        index: str = "winlogbeat-*,logs-windows.sysmon_operational-*",
+        event_ids: Optional[List[int]] = None,
+    ) -> Generator[pd.DataFrame, None, None]:
+        """Yield page-sized DataFrames of Sysmon events (no full materialisation)."""
+        if event_ids is None:
+            event_ids = [1, 3]
+        query = self._sysmon_query(start, end, event_ids)
+        buf: List[Dict] = []
+        for hit in self._paginate(index, query):
+            buf.append(_normalise_row(_extract_sysmon_row(hit)))
+            if len(buf) >= self._page_size:
+                yield _rows_to_df(buf)
+                buf = []
+        if buf:
+            yield _rows_to_df(buf)
+
+    def iter_defend_chunks(
+        self,
+        start: str,
+        end: str,
+        index: str = (
+            "logs-endpoint.events.process-*,"
+            "logs-endpoint.events.network-*"
+        ),
+    ) -> Generator[pd.DataFrame, None, None]:
+        """Yield page-sized DataFrames of Elastic Defend events."""
+        query = self._defend_query(start, end)
+        buf: List[Dict] = []
+        for hit in self._paginate(index, query):
+            buf.append(_normalise_row(_extract_defend_row(hit)))
+            if len(buf) >= self._page_size:
+                yield _rows_to_df(buf)
+                buf = []
+        if buf:
+            yield _rows_to_df(buf)
+
+    def iter_wazuh_chunks(
+        self,
+        start: str,
+        end: str,
+        index: str = "wazuh-alerts-4.x-*,wazuh-archives-4.x-*",
+        event_ids: Optional[List[int]] = None,
+    ) -> Generator[pd.DataFrame, None, None]:
+        """Yield page-sized DataFrames of Wazuh events."""
+        if event_ids is None:
+            event_ids = [1, 3]
+        query = self._wazuh_query(start, end, event_ids)
+        buf: List[Dict] = []
+        for hit in self._paginate(index, query):
+            buf.append(_normalise_row(_extract_wazuh_row(hit)))
+            if len(buf) >= self._page_size:
+                yield _rows_to_df(buf)
+                buf = []
+        if buf:
+            yield _rows_to_df(buf)
+
     # ── public fetch methods ──────────────────────────────────────────────────
     def fetch_sysmon(
         self,

@@ -56,7 +56,7 @@ import pandas as pd
 
 # ── allow running from the project root ───────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
-from elastic_connector import ElasticConnector
+from elastic_connector import ElasticConnector, _rows_to_df, _SCHEMA_DEFAULTS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -121,8 +121,8 @@ def _build_connector(cfg: Dict[str, Any]) -> ElasticConnector:
     )
 
 
-# ── data fetching ──────────────────────────────────────────────────────────────
-def _fetch_window(
+# ── streaming write ────────────────────────────────────────────────────────────
+def _stream_window_to_csv(
     conn: ElasticConnector,
     start: str,
     end: str,
@@ -132,23 +132,51 @@ def _fetch_window(
     sysmon_index: str,
     defend_index: str,
     wazuh_index: str,
-) -> pd.DataFrame:
+    output_path: str,
+    write_header: bool,
+) -> int:
+    """
+    Stream endpoint events directly to *output_path* in chunks, never holding
+    more than one page (~page_size rows) in memory at a time.
+
+    Returns the total number of rows written for this window.
+    """
     log.info("")
     log.info("── %s  [%s → %s]  Label=%d ──", period_name, start, end, label)
-    df = conn.fetch_all(
-        start=start,
-        end=end,
-        sources=sources,
-        sysmon_index=sysmon_index,
-        defend_index=defend_index,
-        wazuh_index=wazuh_index,
-    )
-    df["Label"] = label
 
-    by_eid = df.groupby("EventID").size()
-    log.info("  EventID breakdown: %s", dict(by_eid))
-    log.info("  Hosts found      : %d", df["Computer"].nunique())
-    return df
+    total_written = 0
+    first_chunk = write_header  # write CSV header only on the very first chunk
+
+    def _flush(chunk: pd.DataFrame) -> None:
+        nonlocal total_written, first_chunk
+        chunk = chunk[chunk["EventID"].isin([1, 3])].copy()
+        if chunk.empty:
+            return
+        chunk["Label"] = label
+        chunk.to_csv(
+            output_path,
+            mode="a",
+            header=first_chunk,
+            index=False,
+        )
+        first_chunk = False
+        total_written += len(chunk)
+        log.info("  written %s rows so far (this window)", f"{total_written:,}")
+
+    iterators: List[Any] = []
+    if "sysmon" in sources:
+        iterators.append(conn.iter_sysmon_chunks(start, end, index=sysmon_index))
+    if "defend" in sources:
+        iterators.append(conn.iter_defend_chunks(start, end, index=defend_index))
+    if "wazuh" in sources:
+        iterators.append(conn.iter_wazuh_chunks(start, end, index=wazuh_index))
+
+    for it in iterators:
+        for chunk in it:
+            _flush(chunk)
+
+    log.info("  Window done: %s rows written", f"{total_written:,}")
+    return total_written
 
 
 # ── summary printer ────────────────────────────────────────────────────────────
@@ -222,8 +250,13 @@ def main(config_path: str = "elastic_config.yml", dry_run: bool = False) -> None
     # ── connect ───────────────────────────────────────────────────────────────
     conn = _build_connector(cfg)
 
-    # ── fetch training data: Nov–Dec 2025 → Label=0 (benign) ─────────────────
-    df_train = _fetch_window(
+    # Ensure output directory exists and file is empty / created fresh
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    if Path(output_path).exists():
+        Path(output_path).unlink()
+
+    # ── stream training data: Nov–Dec 2025 → Label=0 (benign) ────────────────
+    n_train = _stream_window_to_csv(
         conn,
         start=train_start,
         end=train_end,
@@ -233,9 +266,11 @@ def main(config_path: str = "elastic_config.yml", dry_run: bool = False) -> None
         sysmon_index=sysmon_index,
         defend_index=defend_index,
         wazuh_index=wazuh_index,
+        output_path=output_path,
+        write_header=True,   # first window writes the CSV header
     )
 
-    if df_train.empty:
+    if n_train == 0:
         log.error(
             "No training data fetched for %s → %s.\n"
             "  Check your index patterns, date range, and ES credentials.",
@@ -243,8 +278,8 @@ def main(config_path: str = "elastic_config.yml", dry_run: bool = False) -> None
         )
         sys.exit(1)
 
-    # ── fetch evaluation data: Jan 2026 → Label=2 (suspicious/unknown) ───────
-    df_eval = _fetch_window(
+    # ── stream evaluation data: Jan 2026 → Label=2 (suspicious/unknown) ──────
+    n_eval = _stream_window_to_csv(
         conn,
         start=eval_start,
         end=eval_end,
@@ -254,23 +289,24 @@ def main(config_path: str = "elastic_config.yml", dry_run: bool = False) -> None
         sysmon_index=sysmon_index,
         defend_index=defend_index,
         wazuh_index=wazuh_index,
+        output_path=output_path,
+        write_header=(n_train == 0),  # only if training wrote nothing (shouldn't happen)
     )
 
-    if df_eval.empty:
+    if n_eval == 0:
         log.warning(
             "No evaluation data fetched for %s → %s. "
             "Pipeline will still run but evaluation metrics will be skipped.",
             eval_start, eval_end,
         )
 
-    # ── merge & sort ──────────────────────────────────────────────────────────
-    df = pd.concat([df_train, df_eval], ignore_index=True)
-    df["_sort_ts"] = pd.to_datetime(df["SystemTime"], utc=True, errors="coerce")
-    df = df.sort_values("_sort_ts").drop(columns=["_sort_ts"]).reset_index(drop=True)
-
-    # ── save ──────────────────────────────────────────────────────────────────
-    df.to_csv(output_path, index=False)
-    _print_summary(df, output_path)
+    # ── final summary (read back from disk — avoids holding all in RAM) ───────
+    log.info("")
+    log.info("Total rows written: %s (train=%s  eval=%s)",
+             f"{n_train + n_eval:,}", f"{n_train:,}", f"{n_eval:,}")
+    log.info("Output → %s", output_path)
+    log.info("Note: CSV is appended in fetch order (not sorted by time).")
+    log.info("      Run: python main.py  — it sorts internally.")
 
 
 if __name__ == "__main__":
