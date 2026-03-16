@@ -341,7 +341,8 @@ class ElasticConnector:
                 yield hit
             total += len(hits)
             search_after = hits[-1]["sort"]
-            logger.debug("  …%d events fetched from %s", total, index)
+            if total % 50_000 < len(hits):   # log roughly every 50k rows
+                logger.info("  …fetched %s rows so far from %s", f"{total:,}", index)
 
     # ── query builders ────────────────────────────────────────────────────────
     @staticmethod
