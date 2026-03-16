@@ -150,6 +150,10 @@ def _stream_window_to_csv(
     def _flush(chunk: pd.DataFrame) -> None:
         nonlocal total_written, first_chunk
         chunk = chunk[chunk["EventID"].isin([1, 3])].copy()
+        # Drop rows with no process identity — these are infrastructure-noise
+        # network events (e.g. Elastic Defend on Linux connecting to port 9200)
+        # that carry no useful graph features.
+        chunk = chunk[chunk["Image"].astype(str).str.len() > 0]
         if chunk.empty:
             return
         chunk["Label"] = label
