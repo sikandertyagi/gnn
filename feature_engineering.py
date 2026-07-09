@@ -116,16 +116,25 @@ def _has_ip(cmd: pd.Series) -> pd.Series:
 
 
 def _has_download(cmd: pd.Series) -> pd.Series:
-    """Detects download-related keywords — droppers / stagers."""
-    pattern = r"wget|curl|invoke-webrequest|\biwr\b|downloadstring|downloadfile|bitsadmin|start-bitstransfer"
+    """Detects download-related keywords — droppers / stagers (Windows + Linux)."""
+    pattern = (
+        r"wget|curl|invoke-webrequest|\biwr\b|downloadstring|downloadfile"
+        r"|bitsadmin|start-bitstransfer|fetch|aria2c|axel|nc\b|ncat\b|socat\b"
+    )
     return cmd.str.contains(pattern, case=False, regex=True, na=False).astype(int)
 
 
 def _has_encodedcommand(cmd: pd.Series) -> pd.Series:
-    """Detects PowerShell -EncodedCommand / -enc flag."""
-    return cmd.str.contains(
-        r"-(?:enc|encodedcommand)\b", case=False, regex=True, na=False
-    ).astype(int)
+    """Detects encoded/obfuscated command patterns (Windows + Linux)."""
+    pattern = (
+        r"-(?:enc|encodedcommand)\b"     # PowerShell encoded command
+        r"|base64\s+-d"                   # Linux base64 decode piped to shell
+        r"|\beval\b.*\$\("               # eval $(…) shell pattern
+        r"|python[23]?\s+-c\s"           # python -c inline code
+        r"|perl\s+-e\s"                  # perl -e inline code
+        r"|ruby\s+-e\s"                  # ruby -e inline code
+    )
+    return cmd.str.contains(pattern, case=False, regex=True, na=False).astype(int)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -230,9 +239,16 @@ def feature_engineering(df: pd.DataFrame):
     img = df["Image"].fillna("").astype(str)
 
     df["path_depth"]   = img.str.count(r"[/\\]")
-    df["is_system32"]  = img.str.contains("system32", case=False, na=False).astype(int)
-    df["is_users_dir"] = img.str.contains("users",    case=False, na=False).astype(int)
-    df["is_temp_exec"] = img.str.contains("temp",     case=False, na=False).astype(int)
+    df["is_system_bin"] = img.str.contains(
+        r"system32|/usr/bin/|/usr/sbin/|/bin/|/sbin/", case=False, na=False
+    ).astype(int)
+    df["is_users_dir"] = img.str.contains(
+        r"[/\\]users[/\\]|/home/", case=False, na=False
+    ).astype(int)
+    df["is_temp_exec"] = img.str.contains(
+        r"[/\\]temp[/\\]|/tmp/|/var/tmp/|/dev/shm/|appdata|downloads|programdata",
+        case=False, na=False,
+    ).astype(int)
 
     # ── binary / metadata features ────────────────────────────────────────────
     df["is_signed"]       = (
@@ -279,7 +295,7 @@ def feature_engineering(df: pd.DataFrame):
         # semantic command-line embeddings: PCA-32 of all-MiniLM-L6-v2 (z-scored)
         *[f"cmd_emb_{i}" for i in range(CMD_EMBED_N_COMPONENTS)],
         "path_depth",
-        "is_system32",
+        "is_system_bin",
         "is_users_dir",
         "is_temp_exec",
         "is_signed",

@@ -197,10 +197,10 @@ Z-scored.
 
 | Index | Name | Description |
 |---|---|---|
-| 46 | `path_depth` | Backslash count in `Image` |
-| 47 | `is_system32` | 1 if "system32" in `Image` path |
-| 48 | `is_users_dir` | 1 if "users" in `Image` path |
-| 49 | `is_temp_exec` | 1 if "temp" in `Image` path |
+| 46 | `path_depth` | Slash/backslash count in `Image` |
+| 47 | `is_system_bin` | 1 if path matches system directories (system32, /usr/bin, /usr/sbin, /bin, /sbin) |
+| 48 | `is_users_dir` | 1 if path matches user directories (\\users\\, /home/) |
+| 49 | `is_temp_exec` | 1 if path matches temp/writable directories (temp, /tmp, /var/tmp, /dev/shm, appdata, downloads, programdata) |
 
 ### Section E — Binary metadata (indices 50–51)
 Z-scored.

@@ -120,7 +120,7 @@ def _fit_encoders(df: pd.DataFrame) -> dict:
 def _process_features(df: pd.DataFrame, enc: LabelEncoder) -> torch.Tensor:
     """
     Features per process node (indexed by enc.classes_):
-      name_hash (normalised), path_depth (normalised), is_system32, is_users_dir,
+      name_hash (normalised), path_depth (normalised), is_system_bin, is_users_dir,
       is_temp_exec, cmd_length_mean (log-normalised), cmd_entropy_mean (normalised),
       has_base64_rate, has_http_rate, is_signed_rate
     All features are scaled to roughly [0, 1].
@@ -157,9 +157,16 @@ def _process_features(df: pd.DataFrame, enc: LabelEncoder) -> torch.Tensor:
     path_depth = images.apply(lambda x: float(len(re.split(r"[/\\]", str(x))) - 1))
     path_depth = (path_depth / path_depth.clip(lower=1).max()).fillna(0.0)
 
-    is_sys32 = images.str.contains("system32", case=False, na=False).astype(float)
-    is_users = images.str.contains("users",    case=False, na=False).astype(float)
-    is_temp  = images.str.contains("temp",     case=False, na=False).astype(float)
+    is_sys_bin = images.str.contains(
+        r"system32|/usr/bin/|/usr/sbin/|/bin/|/sbin/", case=False, na=False
+    ).astype(float)
+    is_users = images.str.contains(
+        r"[/\\]users[/\\]|/home/", case=False, na=False
+    ).astype(float)
+    is_temp = images.str.contains(
+        r"[/\\]temp[/\\]|/tmp/|/var/tmp/|/dev/shm/|appdata|downloads|programdata",
+        case=False, na=False,
+    ).astype(float)
 
     # log-normalise cmd_length_mean (can be 0–thousands)
     cmd_len_norm = np.log1p(agg["cmd_length_mean"].values).astype(np.float32)
@@ -176,7 +183,7 @@ def _process_features(df: pd.DataFrame, enc: LabelEncoder) -> torch.Tensor:
     feat = np.column_stack([
         name_hash.values,
         path_depth.values,
-        is_sys32.values,
+        is_sys_bin.values,
         is_users.values,
         is_temp.values,
         cmd_len_norm,

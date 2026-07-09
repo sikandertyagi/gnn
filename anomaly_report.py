@@ -82,7 +82,10 @@ def _why_suspicious(row: pd.Series) -> list[str]:
     if row.get("has_base64", 0):
         reasons.append("Base64 string (≥20 chars) found in CommandLine")
     if row.get("has_encodedcommand", 0):
-        reasons.append("PowerShell -EncodedCommand / -enc flag detected")
+        reasons.append(
+            "Encoded/obfuscated command detected (PowerShell -enc, base64 decode, "
+            "eval, or inline script execution)"
+        )
     if row.get("has_download", 0):
         reasons.append(
             "Download utility in command (wget / curl / Invoke-WebRequest / "
@@ -97,11 +100,12 @@ def _why_suspicious(row: pd.Series) -> list[str]:
     if row.get("is_temp_exec", 0):
         reasons.append(
             "Executable launched from a temp / user-writable directory "
-            "(AppData, Temp, Downloads, ProgramData)"
+            "(Temp, /tmp, /dev/shm, AppData, Downloads, ProgramData)"
         )
-    if not row.get("is_system32", 0) and not row.get("is_signed", 1):
+    if not row.get("is_system_bin", 0) and not row.get("is_signed", 1):
         reasons.append(
-            "Unsigned binary running outside System32 — uncommon for legitimate software"
+            "Binary running outside standard system paths (System32, /usr/bin, "
+            "/usr/sbin) — uncommon for legitimate software"
         )
     if row.get("missing_company", 0):
         reasons.append("Binary has no Company metadata in PE header")
@@ -416,7 +420,7 @@ def generate_investigation_report(
         # readable feature flags
         "has_base64", "has_encodedcommand", "has_download",
         "has_http", "has_ip",
-        "is_system32", "is_temp_exec", "is_signed", "missing_company",
+        "is_system_bin", "is_temp_exec", "is_signed", "missing_company",
         "cmd_entropy",
         "ProcessGuid", "ParentProcessGuid",
     ]
