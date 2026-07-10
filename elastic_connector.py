@@ -31,6 +31,7 @@ Output schema (pipeline columns)
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, Generator, List, Optional
 
 import pandas as pd
@@ -308,21 +309,25 @@ class ElasticConnector:
         )
 
     # ── low-level pagination ──────────────────────────────────────────────────
+    _MAX_RETRIES = 6
+    _BASE_BACKOFF = 5  # seconds
+
     def _paginate(
         self,
         index: str,
         query: Dict,
     ) -> Generator[Dict, None, None]:
         """
-        Yield raw hit dicts using search_after + (_id, @timestamp) sort.
-        This is more reliable than scroll for time-windowed queries.
+        Yield raw hit dicts using search_after + @timestamp sort.
+        Retries each page up to _MAX_RETRIES times with exponential backoff
+        on connection/timeout errors.
         """
         body: Dict[str, Any] = {
             "query": query,
             "size": self._page_size,
             "sort": [
                 {"@timestamp": {"order": "asc"}},
-                {"_shard_doc": "asc"},          # recommended tiebreaker; _id sort breaks on large data-stream indices
+                {"_shard_doc": "asc"},
             ],
         }
         search_after = None
@@ -332,8 +337,7 @@ class ElasticConnector:
             if search_after:
                 body["search_after"] = search_after
 
-            resp = self._es.search(index=index, body=body, expand_wildcards="all")
-            hits = resp["hits"]["hits"]
+            hits = self._search_with_retry(index, body)
             if not hits:
                 break
 
@@ -341,8 +345,36 @@ class ElasticConnector:
                 yield hit
             total += len(hits)
             search_after = hits[-1]["sort"]
-            if total % 50_000 < len(hits):   # log roughly every 50k rows
+            if total % 50_000 < len(hits):
                 logger.info("  …fetched %s rows so far from %s", f"{total:,}", index)
+
+    def _search_with_retry(self, index: str, body: Dict) -> List[Dict]:
+        """Execute a search request with retry + exponential backoff."""
+        for attempt in range(1, self._MAX_RETRIES + 1):
+            try:
+                resp = self._es.search(
+                    index=index, body=body, expand_wildcards="all",
+                    request_timeout=120,
+                )
+                return resp["hits"]["hits"]
+            except Exception as exc:
+                exc_name = type(exc).__name__
+                is_retryable = any(s in exc_name for s in (
+                    "Connection", "Timeout", "Transport",
+                )) or "timed out" in str(exc).lower()
+
+                if not is_retryable or attempt == self._MAX_RETRIES:
+                    logger.error("Search failed (attempt %d/%d): %s",
+                                 attempt, self._MAX_RETRIES, exc)
+                    raise
+
+                wait = self._BASE_BACKOFF * (2 ** (attempt - 1))
+                logger.warning(
+                    "Search failed (attempt %d/%d): %s — retrying in %ds…",
+                    attempt, self._MAX_RETRIES, exc_name, wait,
+                )
+                time.sleep(wait)
+        return []
 
     # ── query builders ────────────────────────────────────────────────────────
     @staticmethod

@@ -216,8 +216,73 @@ def _print_summary(df: pd.DataFrame, output_path: str) -> None:
     log.info(sep)
 
 
+# ── resume detection ──────────────────────────────────────────────────────────
+
+def _detect_resume_state(output_path: str) -> Optional[dict]:
+    """
+    If the output CSV already exists, read its last rows to determine where
+    the previous run stopped.  Returns a dict with resume info or None.
+    """
+    p = Path(output_path)
+    if not p.exists() or p.stat().st_size == 0:
+        return None
+
+    try:
+        # Read only the last chunk to find the resume point
+        # Use tail-reading to avoid loading the whole file
+        import subprocess
+        n_existing = int(subprocess.check_output(
+            ["wc", "-l", str(p)]
+        ).split()[0]) - 1  # subtract header
+    except Exception:
+        n_existing = 0
+
+    if n_existing <= 0:
+        return None
+
+    # Read the last 1000 rows to find max timestamp and labels present
+    try:
+        tail_df = pd.read_csv(p, skiprows=range(1, max(1, n_existing - 999)),
+                              low_memory=False)
+    except Exception:
+        tail_df = pd.read_csv(p, low_memory=False)
+
+    # Also read just the first 5 rows to detect labels in training window
+    try:
+        head_df = pd.read_csv(p, nrows=5, low_memory=False)
+    except Exception:
+        head_df = pd.DataFrame()
+
+    labels_present = set()
+    if "Label" in tail_df.columns:
+        labels_present.update(tail_df["Label"].unique().tolist())
+    if "Label" in head_df.columns:
+        labels_present.update(head_df["Label"].unique().tolist())
+
+    last_ts = None
+    last_label = None
+    if "SystemTime" in tail_df.columns and "Label" in tail_df.columns:
+        tail_df["_ts"] = pd.to_datetime(tail_df["SystemTime"], errors="coerce", utc=True)
+        valid = tail_df.dropna(subset=["_ts"])
+        if not valid.empty:
+            last_row = valid.iloc[-1]
+            last_ts = last_row["_ts"].strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            last_label = int(last_row["Label"])
+
+    return {
+        "n_existing": n_existing,
+        "last_timestamp": last_ts,
+        "last_label": last_label,
+        "labels_present": labels_present,
+    }
+
+
 # ── main ───────────────────────────────────────────────────────────────────────
-def main(config_path: str = "elastic_config.yml", dry_run: bool = False) -> None:
+def main(
+    config_path: str = "elastic_config.yml",
+    dry_run: bool = False,
+    resume: bool = False,
+) -> None:
     cfg = _load_config(config_path)
 
     # ── date windows ──────────────────────────────────────────────────────────
@@ -251,41 +316,86 @@ def main(config_path: str = "elastic_config.yml", dry_run: bool = False) -> None
         log.info("[DRY-RUN] Skipping Elasticsearch connection.")
         return
 
+    # ── resume detection ─────────────────────────────────────────────────────
+    skip_train = False
+    adjusted_start: Optional[str] = None
+
+    if resume:
+        state = _detect_resume_state(output_path)
+        if state:
+            log.info("")
+            log.info("═" * 62)
+            log.info("  RESUMING from previous partial run")
+            log.info("  Existing rows  : %s", f"{state['n_existing']:,}")
+            log.info("  Last timestamp : %s", state["last_timestamp"])
+            log.info("  Last label     : %s", state["last_label"])
+            log.info("  Labels present : %s", state["labels_present"])
+            log.info("═" * 62)
+
+            if state["last_label"] == 2:
+                # Was writing eval data — training is done, resume eval
+                skip_train = True
+                adjusted_start = state["last_timestamp"]
+                log.info("  → Training window complete. Resuming eval from %s",
+                         adjusted_start)
+            elif state["last_label"] == 0:
+                # Was still writing training data — resume training
+                skip_train = False
+                adjusted_start = state["last_timestamp"]
+                log.info("  → Resuming training window from %s", adjusted_start)
+            else:
+                log.warning("  → Unrecognised last_label=%s; resuming training",
+                            state["last_label"])
+        else:
+            log.info("No existing data found at %s — starting fresh.", output_path)
+            resume = False  # fall through to fresh start
+
     # ── connect ───────────────────────────────────────────────────────────────
     conn = _build_connector(cfg)
 
-    # Ensure output directory exists and file is empty / created fresh
+    # Ensure output directory exists
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    if Path(output_path).exists():
-        Path(output_path).unlink()
+
+    if not resume:
+        # Fresh start — clear any existing file
+        if Path(output_path).exists():
+            Path(output_path).unlink()
 
     # ── stream training data: Nov–Dec 2025 → Label=0 (benign) ────────────────
-    n_train = _stream_window_to_csv(
-        conn,
-        start=train_start,
-        end=train_end,
-        label=0,
-        period_name="TRAINING  (Nov–Dec 2025)",
-        sources=sources,
-        sysmon_index=sysmon_index,
-        defend_index=defend_index,
-        wazuh_index=wazuh_index,
-        output_path=output_path,
-        write_header=True,   # first window writes the CSV header
-    )
-
-    if n_train == 0:
-        log.error(
-            "No training data fetched for %s → %s.\n"
-            "  Check your index patterns, date range, and ES credentials.",
-            train_start, train_end,
+    n_train = 0
+    if not skip_train:
+        effective_train_start = adjusted_start if adjusted_start else train_start
+        n_train = _stream_window_to_csv(
+            conn,
+            start=effective_train_start,
+            end=train_end,
+            label=0,
+            period_name="TRAINING  (Nov–Dec 2025)",
+            sources=sources,
+            sysmon_index=sysmon_index,
+            defend_index=defend_index,
+            wazuh_index=wazuh_index,
+            output_path=output_path,
+            write_header=not resume,  # header already written on resume
         )
-        sys.exit(1)
+
+        if n_train == 0 and not resume:
+            log.error(
+                "No training data fetched for %s → %s.\n"
+                "  Check your index patterns, date range, and ES credentials.",
+                effective_train_start, train_end,
+            )
+            sys.exit(1)
 
     # ── stream evaluation data: Jan 2026 → Label=2 (suspicious/unknown) ──────
+    effective_eval_start = eval_start
+    if skip_train and adjusted_start:
+        effective_eval_start = adjusted_start
+
+    file_exists = Path(output_path).exists() and Path(output_path).stat().st_size > 0
     n_eval = _stream_window_to_csv(
         conn,
-        start=eval_start,
+        start=effective_eval_start,
         end=eval_end,
         label=2,
         period_name="EVALUATION (Jan  2026)",
@@ -294,23 +404,26 @@ def main(config_path: str = "elastic_config.yml", dry_run: bool = False) -> None
         defend_index=defend_index,
         wazuh_index=wazuh_index,
         output_path=output_path,
-        write_header=(n_train == 0),  # only if training wrote nothing (shouldn't happen)
+        write_header=not file_exists,
     )
 
     if n_eval == 0:
         log.warning(
             "No evaluation data fetched for %s → %s. "
             "Pipeline will still run but evaluation metrics will be skipped.",
-            eval_start, eval_end,
+            effective_eval_start, eval_end,
         )
 
-    # ── final summary (read back from disk — avoids holding all in RAM) ───────
+    # ── final summary ────────────────────────────────────────────────────────
     log.info("")
-    log.info("Total rows written: %s (train=%s  eval=%s)",
+    log.info("Total rows written this run: %s (train=%s  eval=%s)",
              f"{n_train + n_eval:,}", f"{n_train:,}", f"{n_eval:,}")
     log.info("Output → %s", output_path)
     log.info("Note: CSV is appended in fetch order (not sorted by time).")
     log.info("      Run: python main.py  — it sorts internally.")
+    if resume:
+        log.info("      (resumed run — some duplicate rows near the resume point")
+        log.info("       will be deduplicated by main.py automatically)")
 
 
 if __name__ == "__main__":
@@ -329,5 +442,10 @@ if __name__ == "__main__":
         action="store_true",
         help="Print config and exit without connecting to Elasticsearch",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from a previous interrupted run instead of starting over",
+    )
     args = parser.parse_args()
-    main(config_path=args.config, dry_run=args.dry_run)
+    main(config_path=args.config, dry_run=args.dry_run, resume=args.resume)
