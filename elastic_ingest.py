@@ -240,9 +240,12 @@ def _detect_resume_state(output_path: str) -> Optional[dict]:
     if n_existing <= 0:
         return None
 
-    # Read the last 1000 rows to find max timestamp and labels present
+    # Read the last 10,000 rows to find the true max timestamp.
+    # Pagination fetches are 5,000 rows each, so 10k covers at least
+    # 2 full pages and handles out-of-order timestamps within a page.
+    tail_size = 10_000
     try:
-        tail_df = pd.read_csv(p, skiprows=range(1, max(1, n_existing - 999)),
+        tail_df = pd.read_csv(p, skiprows=range(1, max(1, n_existing - tail_size + 1)),
                               low_memory=False)
     except Exception:
         tail_df = pd.read_csv(p, low_memory=False)
@@ -265,9 +268,14 @@ def _detect_resume_state(output_path: str) -> Optional[dict]:
         tail_df["_ts"] = pd.to_datetime(tail_df["SystemTime"], errors="coerce", utc=True)
         valid = tail_df.dropna(subset=["_ts"])
         if not valid.empty:
-            last_row = valid.iloc[-1]
-            last_ts = last_row["_ts"].strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-            last_label = int(last_row["Label"])
+            # Use the MAX timestamp, not the last row — CSV is in fetch order,
+            # not sorted by time, so the last row may have an earlier timestamp.
+            max_ts = valid["_ts"].max()
+            last_label = int(valid.loc[valid["_ts"] == max_ts, "Label"].iloc[0])
+            # Add 1ms to skip past all events at this exact timestamp,
+            # preventing duplicates on resume.
+            resume_ts = max_ts + pd.Timedelta(milliseconds=1)
+            last_ts = resume_ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
     return {
         "n_existing": n_existing,
