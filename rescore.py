@@ -41,8 +41,11 @@ def main():
     if "Label" not in df.columns:
         df["Label"] = 0
     df["EventID"] = pd.to_numeric(df["EventID"], errors="coerce")
-    df = df[df["EventID"].isin(HIGH_SIGNAL_EVENTIDS)].reset_index(drop=True)
-    print(f"      {len(df):,} events after EventID filter")
+    if HIGH_SIGNAL_EVENTIDS is not None:
+        df = df[df["EventID"].isin(HIGH_SIGNAL_EVENTIDS)].reset_index(drop=True)
+        print(f"      {len(df):,} events after EventID filter")
+    else:
+        print(f"      {len(df):,} events (no EventID filter)")
 
     print("\n[3/4] Re-computing composite scores with current weights...")
     dense_errors = df_scores["dense_error"].values if "dense_error" in df_scores.columns else None

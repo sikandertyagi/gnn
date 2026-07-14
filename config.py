@@ -46,13 +46,10 @@ SCALER_PATH = os.path.join(ARTIFACTS_DIR, "scaler.pkl")
 
 FEATURE_COLUMNS = []
 
-# ── transformer event filter ──────────────────────────────────────────────────
-# Only EventID 1 (process creation) and 3 (network connection) carry strong
-# attack signal for the transformer autoencoder.  Using all event types dilutes
-# the training signal: the model learns to reconstruct benign module-loads,
-# registry writes, and terminations equally well — so attack sequences look no
-# different from benign ones (AUC ≈ 0.50).
-HIGH_SIGNAL_EVENTIDS = [1, 3]       # process creation + network connection
+# ── event filter ──────────────────────────────────────────────────────────────
+# Set to a list of EventIDs to keep (e.g. [1, 3] for process creation +
+# network connection only).  Set to None to use all event types.
+HIGH_SIGNAL_EVENTIDS = None          # None = use all events
 
 # ── GNN encoder ───────────────────────────────────────────────────────────────
 GNN_EMBED_DIM          = 64

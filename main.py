@@ -123,15 +123,15 @@ def main():
         df["Label"] = 0
 
     # ── EventID filter (applied once, globally) ───────────────────────────────
-    # Retain only EventID 1 (process creation) and 3 (network connection).
-    # All three engines (GNN, rarity, transformer), training, inference, and
-    # evaluation metrics operate exclusively on these two event types.
     n_raw = len(df)
     df["EventID"] = pd.to_numeric(df["EventID"], errors="coerce")
-    df = df[df["EventID"].isin(HIGH_SIGNAL_EVENTIDS)].reset_index(drop=True)
+    if HIGH_SIGNAL_EVENTIDS is not None:
+        df = df[df["EventID"].isin(HIGH_SIGNAL_EVENTIDS)].reset_index(drop=True)
+        print(f"      EventID filter: {n_raw:,} → {len(df):,} events "
+              f"(kept EventIDs {HIGH_SIGNAL_EVENTIDS})")
+    else:
+        print(f"      EventID filter: OFF — using all {n_raw:,} events")
     n_events = len(df)
-    print(f"      EventID filter: {n_raw:,} → {n_events:,} events "
-          f"(kept EventIDs {HIGH_SIGNAL_EVENTIDS})")
 
     use_memmap = n_events > LARGE_DATASET_THRESHOLD
     print(f"      {'large (memmap)' if use_memmap else 'small (in-memory)'} mode")
