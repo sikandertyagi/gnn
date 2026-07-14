@@ -77,7 +77,9 @@ GRAPH_WEIGHT  = 0.00        # GNN graph anomaly score (disabled: ablation AUC=0.
 RARITY_WEIGHT = 0.30        # rare behaviour score
 
 # ── alert aggregation ─────────────────────────────────────────────────────────
-ALERT_THRESHOLD = 0.40      # score threshold to flag an event
+ALERT_PERCENTILE = 97.5     # percentile of benign composite scores → threshold
+ALERT_THRESHOLD  = None     # computed at runtime from ALERT_PERCENTILE; set a
+                            # float here to override with a fixed threshold
 ALERT_WINDOW    = 300       # seconds: max gap to chain consecutive alerts
 ALERTS_PATH     = os.path.join(ARTIFACTS_DIR, "alerts.csv")
 

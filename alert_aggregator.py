@@ -23,7 +23,7 @@ from config import ALERT_THRESHOLD, ALERT_WINDOW
 def aggregate_alerts(
     df:         pd.DataFrame,
     scores:     np.ndarray,
-    threshold:  float = ALERT_THRESHOLD,
+    threshold:  float | None = ALERT_THRESHOLD,
     window_sec: int   = ALERT_WINDOW,
 ) -> pd.DataFrame:
     """

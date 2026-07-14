@@ -71,6 +71,7 @@ from config import (
     HIGH_SIGNAL_EVENTIDS,
     HAS_GROUND_TRUTH,
     ANOMALY_REPORT_PATH, FLAGGED_EVENTS_PATH,
+    ALERT_THRESHOLD, ALERT_PERCENTILE,
 )
 from feature_engineering import feature_engineering
 from normaliser import fit_scaler, apply_scaler
@@ -306,7 +307,16 @@ def main():
         ["score", "dense_error", "recon_error", "graph_score", "rarity_score"]
     ].mean().to_string())
 
-    alerts = aggregate_alerts(df, composite)
+    # ── compute alert threshold from benign composite scores ─────────────────
+    if ALERT_THRESHOLD is not None:
+        threshold = ALERT_THRESHOLD
+        print(f"\n  Alert threshold (fixed)     : {threshold:.6f}")
+    else:
+        benign_scores = composite[df["Label"].values == TRAIN_LABEL]
+        threshold = float(np.percentile(benign_scores, ALERT_PERCENTILE))
+        print(f"\n  Alert threshold (p{ALERT_PERCENTILE} benign): {threshold:.6f}")
+
+    alerts = aggregate_alerts(df, composite, threshold=threshold)
     alerts.to_csv(ALERTS_PATH, index=False)
     print(f"\n  Alerts saved -> {ALERTS_PATH}")
 
@@ -326,6 +336,7 @@ def main():
         df_alerts   = alerts,
         report_path = ANOMALY_REPORT_PATH,
         csv_path    = FLAGGED_EVENTS_PATH,
+        threshold   = threshold,
     )
 
     # ── skip AUC / F1 when no ground-truth labels exist ───────────────────────

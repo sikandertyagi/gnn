@@ -50,7 +50,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from config import ALERT_THRESHOLD
+from config import ALERT_THRESHOLD, ALERT_PERCENTILE
 
 
 # ── "why suspicious" hint engine ─────────────────────────────────────────────
@@ -140,9 +140,10 @@ def _why_suspicious(row: pd.Series) -> list[str]:
         )
 
     if not reasons:
+        thr_str = f"{ALERT_THRESHOLD:.4f}" if ALERT_THRESHOLD is not None else "auto"
         reasons.append(
             f"Composite anomaly score {score:.3f} exceeds threshold "
-            f"{ALERT_THRESHOLD:.2f} — verify against baseline behaviour"
+            f"{thr_str} — verify against baseline behaviour"
         )
 
     return reasons
@@ -209,6 +210,7 @@ def generate_investigation_report(
     report_path: str = "anomaly_report.txt",
     csv_path:    str = "flagged_events.csv",
     top_n:       int = 200,
+    threshold:   float | None = None,
 ) -> None:
     """
     Write anomaly_report.txt and flagged_events.csv.
@@ -224,6 +226,9 @@ def generate_investigation_report(
     top_n      : Maximum number of events to detail individually in the report
     """
 
+    if threshold is None:
+        threshold = ALERT_THRESHOLD if ALERT_THRESHOLD is not None else 0.40
+
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     # ── join scores onto events ───────────────────────────────────────────────
@@ -238,7 +243,7 @@ def generate_investigation_report(
     eval_df = df[df["label"] != 0].copy()
 
     # ── flagged events: score ≥ threshold in evaluation period ───────────────
-    flagged = eval_df[eval_df["score"] >= ALERT_THRESHOLD].copy()
+    flagged = eval_df[eval_df["score"] >= threshold].copy()
     flagged = flagged.sort_values("score", ascending=False).reset_index()
     # 'index' column is the original row index in df_events (for reference)
     flagged = flagged.rename(columns={"index": "original_row_index"})
@@ -279,7 +284,7 @@ def generate_investigation_report(
         "  ANOMALY INVESTIGATION REPORT",
         f"  Generated : {now_str}",
         f"  Pipeline  : GNN Anomaly Detection — Elastic SIEM Integration",
-        f"  Threshold : {ALERT_THRESHOLD}  (events above this score are flagged)",
+        f"  Threshold : {threshold:.6f}  (p{ALERT_PERCENTILE} of benign composite scores)",
         hr,
     ]
 
@@ -287,7 +292,7 @@ def generate_investigation_report(
     section("EXECUTIVE SUMMARY")
     lines += [
         f"  Evaluation period events : {n_eval:,}",
-        f"  Flagged events (≥{ALERT_THRESHOLD:.2f})    : {n_flagged:,}"
+        f"  Flagged events (≥{threshold:.4f})   : {n_flagged:,}"
         f"  ({100 * n_flagged / max(n_eval, 1):.2f}% of eval period)",
         f"  Hosts in evaluation      : {n_hosts_eval}",
         f"  Hosts with flagged events: {n_hosts_flagged}",
@@ -326,9 +331,9 @@ def generate_investigation_report(
             )
     else:
         lines.append(
-            f"  No events exceeded the threshold ({ALERT_THRESHOLD}).  "
-            "The Jan 2026 activity appears consistent with the Nov–Dec 2025 baseline.\n"
-            "  Consider lowering ALERT_THRESHOLD in config.py if you expect more findings."
+            f"  No events exceeded the threshold ({threshold:.4f}).  "
+            "The evaluation-period activity appears consistent with the training baseline.\n"
+            "  Consider lowering ALERT_PERCENTILE in config.py if you expect more findings."
         )
 
     # alert chain summaries
