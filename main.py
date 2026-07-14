@@ -5,9 +5,8 @@ Full end-to-end pipeline:
 
   Sysmon CSV
     │
-    ▼  EventID filter [1, 3] only  ← applied at load time; all three engines
-    │                                  and all evaluation metrics use only these
-    │                                  two high-signal event types
+    ▼  EventID filter [1, 3] only  ← applied at load time; all engines
+    │                                  and evaluation use only these two
     ▼  feature_engineering.py      (vectorised; missing columns filled safely)
   Tabular feature matrix  +  enriched DataFrame
     │
@@ -27,6 +26,11 @@ Full end-to-end pipeline:
     │       ▼
     │   rarity_scores              (N_events,)
     │
+    ├─► dense_autoencoder.py       single-event dense AE  ← NEW
+    │       │                      (sharp per-event signal, no sequence dilution)
+    │       ▼
+    │   dense_errors               (N_events,)
+    │
     ├─► sequence_builder.py
     │   sliding-window sequences   small → in-memory ndarray
     │                              large → np.memmap on disk
@@ -37,7 +41,7 @@ Full end-to-end pipeline:
     │       ▼  evaluate.py         (batched inference)
     │   reconstruction_errors      (N_seq_events,) → index-aligned → (N_events,)
     │
-    ▼  anomaly_engine.py
+    ▼  anomaly_engine.py           four-signal composite (dense + recon + graph + rarity)
   Composite anomaly scores         (N_events,)
     │
     ▼  alert_aggregator.py
@@ -59,7 +63,7 @@ from config import (
     DATA_PATH, SEQUENCE_LENGTH, TRAIN_LABEL,
     EPOCHS, BATCH_SIZE, LEARNING_RATE, VAL_RATIO, EARLY_STOPPING_PATIENCE,
     GNN_EPOCHS, GNN_LR,
-    MODEL_PATH, GNN_MODEL_PATH,
+    MODEL_PATH, GNN_MODEL_PATH, DENSE_MODEL_PATH,
     SCORES_PATH, ALERTS_PATH,
     LARGE_DATASET_THRESHOLD, SEQ_MEMMAP_PATH, LABELS_MEMMAP_PATH,
     INFER_BATCH_SIZE,
@@ -78,6 +82,7 @@ from sequence_builder import (build_sequences, build_sequences_memmap,
 from transformer_autoencoder import TransformerAutoencoder
 from train import train_model, train_model_large
 from evaluate import anomaly_scores
+from dense_autoencoder import train_dense_ae, dense_anomaly_scores
 from anomaly_engine import compute_anomaly_scores
 from alert_aggregator import aggregate_alerts
 from metrics import evaluate
@@ -107,7 +112,7 @@ def main():
     print(f"      Artifacts dir : {ARTIFACTS_DIR}")
 
     # ── 1. load data ──────────────────────────────────────────────────────────
-    print("\n[1/9] Loading dataset...")
+    print("\n[1/10] Loading dataset...")
     df = pd.read_csv(DATA_PATH)
 
     # ensure Label column exists (allows inference on unlabelled CSVs)
@@ -131,18 +136,18 @@ def main():
     print(f"      {'large (memmap)' if use_memmap else 'small (in-memory)'} mode")
 
     # ── 2. feature engineering ────────────────────────────────────────────────
-    print("\n[2/9] Feature engineering...")
+    print("\n[2/10] Feature engineering...")
     df, feature_cols = feature_engineering(df)
     print(f"      {len(feature_cols)} feature columns")
 
     # ── 3. normalise features (benign-fit StandardScaler) ─────────────────────
-    print("\n[3/9] Fitting StandardScaler on benign rows...")
+    print("\n[3/10] Fitting StandardScaler on benign rows...")
     scaler = fit_scaler(df, feature_cols)
     df     = apply_scaler(df, feature_cols, scaler)
     print(f"      Scaler saved → scaler.pkl")
 
     # ── 4. build heterogeneous event graph ────────────────────────────────────
-    print("\n[4/9] Building event graph...")
+    print("\n[4/10] Building event graph...")
     df_benign = df[df["Label"] == TRAIN_LABEL]
 
     # Fix #1: build full_graph first to get shared encoders, then reuse them
@@ -164,7 +169,7 @@ def main():
     print(f"      {pp_edges:,} parent->child edges  {pi_edges:,} process->IP edges")
 
     # ── 5. train GNN encoder (benign graph, early stopping) ───────────────────
-    print("\n[5/9] Training GNN encoder on benign graph...")
+    print("\n[5/10] Training GNN encoder on benign graph...")
     # Fix #1: use full_graph's feat_dims so model matches inference graph dims
     feat_dims = node_feature_dims(full_graph)
     gnn_model = HeteroGNNEncoder(feat_dims)
@@ -173,7 +178,7 @@ def main():
     print(f"      Saved -> {GNN_MODEL_PATH}")
 
     # ── 6. per-event graph anomaly scores ─────────────────────────────────────
-    print("\n[6/9] Computing graph anomaly scores...")
+    print("\n[6/10] Computing graph anomaly scores...")
     proc_graph_scores = graph_anomaly_scores(
         gnn_model, full_graph, benign_graph, encoders["process"]
     )
@@ -184,13 +189,24 @@ def main():
     print(f"      mean graph score : {event_graph_scores.mean():.4f}")
 
     # ── 7. rarity scoring ─────────────────────────────────────────────────────
-    print("\n[7/9] Fitting rarity engine & scoring...  [vectorised]")
+    print("\n[7/10] Fitting rarity engine & scoring...  [vectorised]")
     rarity              = RarityEngine().fit(df)
     event_rarity_scores = rarity.score_dataframe(df)
     print(f"      mean rarity score: {event_rarity_scores.mean():.4f}")
 
-    # ── 8. sequences + transformer autoencoder ────────────────────────────────
-    print(f"\n[8/9] Building sequences & training Transformer autoencoder...")
+    # ── 8. dense autoencoder (single-event) ─────────────────────────────────
+    print("\n[8/10] Training dense autoencoder on individual events...")
+    X_all = df[feature_cols].values.astype(np.float32)
+    X_benign_events = X_all[df["Label"].values == TRAIN_LABEL]
+    dense_model = train_dense_ae(X_benign_events, feature_dim=len(feature_cols))
+    torch.save(dense_model.state_dict(), DENSE_MODEL_PATH)
+    print(f"      Saved -> {DENSE_MODEL_PATH}")
+
+    event_dense_errors = dense_anomaly_scores(dense_model, X_all)
+    print(f"      mean dense error : {event_dense_errors.mean():.4f}")
+
+    # ── 9. sequences + transformer autoencoder ────────────────────────────────
+    print(f"\n[9/10] Building sequences & training Transformer autoencoder...")
     print(f"      {n_events:,} events (EventIDs {HIGH_SIGNAL_EVENTIDS} only)")
 
     if use_memmap:
@@ -264,17 +280,19 @@ def main():
     print(f"      mean recon error : {np.nanmean(event_recon_errors):.4f}  "
           f"({n_valid:,} events scored, {n_events - n_valid:,} warmup NaN)")
 
-    # ── 9. composite scores, alerts, evaluation ────────────────────────────────
-    print("\n[9/9] Composite scoring, alerts & evaluation...")
+    # ── 10. composite scores, alerts, evaluation ───────────────────────────────
+    print("\n[10/10] Composite scoring, alerts & evaluation...")
     composite = compute_anomaly_scores(
         event_recon_errors,
         event_graph_scores,
         event_rarity_scores,
         df["Label"].values,
+        dense_errors=event_dense_errors,
     )
 
     df_scores = pd.DataFrame({
         "score":        composite,
+        "dense_error":  event_dense_errors,
         "recon_error":  event_recon_errors,
         "graph_score":  event_graph_scores,
         "rarity_score": event_rarity_scores,
@@ -285,7 +303,7 @@ def main():
 
     print("\n  Score summary by label:")
     print(df_scores.groupby("label")[
-        ["score", "recon_error", "graph_score", "rarity_score"]
+        ["score", "dense_error", "recon_error", "graph_score", "rarity_score"]
     ].mean().to_string())
 
     alerts = aggregate_alerts(df, composite)

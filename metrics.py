@@ -157,7 +157,7 @@ def evaluate(
 
     # ── per-component AUC (ablation table) ────────────────────────────────────
     _section("Per-Component ROC-AUC  (ablation)")
-    for col in ["recon_error", "graph_score", "rarity_score", "score"]:
+    for col in ["dense_error", "recon_error", "graph_score", "rarity_score", "score"]:
         if col not in df_scores.columns:
             continue
         auc = _safe_auc(roc_auc_score, binary, df_scores[col].values)

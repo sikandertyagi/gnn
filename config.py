@@ -61,10 +61,20 @@ GNN_LR                 = 1e-3
 GNN_MODEL_PATH         = os.path.join(ARTIFACTS_DIR, "gnn_encoder.pt")
 GNN_EARLY_STOPPING_PAT = 5
 
+# ── dense autoencoder (single-event) ──────────────────────────────────────────
+DENSE_HIDDEN_DIMS          = (32, 16)   # encoder layers (decoder mirrors)
+DENSE_EPOCHS               = 20
+DENSE_BATCH_SIZE           = 1024
+DENSE_LR                   = 1e-3
+DENSE_VAL_RATIO            = 0.15
+DENSE_EARLY_STOPPING_PATIENCE = 5
+DENSE_MODEL_PATH           = os.path.join(ARTIFACTS_DIR, "dense_autoencoder.pt")
+
 # ── anomaly scoring weights  (must sum to 1.0) ────────────────────────────────
-RECON_WEIGHT  = 0.45        # transformer reconstruction error
+DENSE_WEIGHT  = 0.50        # dense AE per-event reconstruction error
+RECON_WEIGHT  = 0.20        # transformer sequence reconstruction error
 GRAPH_WEIGHT  = 0.00        # GNN graph anomaly score (disabled: ablation AUC=0.31 < random)
-RARITY_WEIGHT = 0.55        # rare behaviour score
+RARITY_WEIGHT = 0.30        # rare behaviour score
 
 # ── alert aggregation ─────────────────────────────────────────────────────────
 ALERT_THRESHOLD = 0.40      # score threshold to flag an event
