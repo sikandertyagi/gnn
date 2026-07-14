@@ -31,6 +31,7 @@ proportionally to the available signals for warmup events:
     scored   → RECON_WEIGHT·r + RARITY_WEIGHT·s
     warmup   → (RARITY_WEIGHT / remain)·s  =  s
                where remain = RARITY_WEIGHT  (GRAPH_WEIGHT = 0)
+    recon-only (RARITY=0, GRAPH=0) → warmup events get score 0
 """
 
 import numpy as np
@@ -74,10 +75,14 @@ def compute_anomaly_scores(
     # Scored events: full three-component weighted sum.
     scored_composite = RECON_WEIGHT * r + GRAPH_WEIGHT * g + RARITY_WEIGHT * s
 
-    # Unscored events: redistribute RECON_WEIGHT to the two available signals
+    # Unscored events: redistribute RECON_WEIGHT to the available signals
     # so the composite still spans [0, 1] — same ceiling as scored events.
     remain = GRAPH_WEIGHT + RARITY_WEIGHT
-    unscored_composite = (GRAPH_WEIGHT / remain) * g + (RARITY_WEIGHT / remain) * s
+    if remain > 0:
+        unscored_composite = (GRAPH_WEIGHT / remain) * g + (RARITY_WEIGHT / remain) * s
+    else:
+        # All weight is on recon — warmup events have no signal, score them 0
+        unscored_composite = np.zeros_like(r)
 
     return np.where(has_recon, scored_composite, unscored_composite).astype(np.float32)
 
