@@ -99,15 +99,25 @@ def compute_anomaly_scores(
 def _normalise(arr: np.ndarray,
                benign_mask: np.ndarray | None = None) -> np.ndarray:
     """
-    Min-max normalise, fitting the range on benign rows only when a mask is
-    supplied.  NaN entries are filled with 0 after normalisation.
+    Percentile-clipped normalisation.  The range is fitted on the p0.5–p99.5
+    of benign rows (when a mask is supplied) so that a handful of extreme
+    outliers cannot stretch the scale and compress all other values to ≈ 0.
+
+    Values below p0.5 map to 0; values above p99.5 map to > 1 (unclamped,
+    so attack events can exceed 1.0 — the composite just weights them).
+    NaN entries are filled with 0 after normalisation.
     """
     if benign_mask is not None and benign_mask.any():
-        mn = np.nanmin(arr[benign_mask])
-        mx = np.nanmax(arr[benign_mask])
+        ref = arr[benign_mask]
     else:
-        mn = np.nanmin(arr)
-        mx = np.nanmax(arr)
+        ref = arr
+
+    valid = ref[~np.isnan(ref)]
+    if len(valid) < 2:
+        return np.zeros_like(arr, dtype=np.float32)
+
+    mn = float(np.percentile(valid, 0.5))
+    mx = float(np.percentile(valid, 99.5))
 
     if mx - mn < 1e-6:
         return np.zeros_like(arr, dtype=np.float32)
