@@ -388,12 +388,18 @@ def main():
     _set_seeds(RANDOM_SEED)
     os.makedirs(ARTIFACTS_DIR, exist_ok=True)
 
-    # ── 1. load data (all events) ────────────────────────────────────────────
+    # ── 1. load data ────────────────────────────────────────────────────────
     print("[1/5] Loading data...")
     df = pd.read_csv(DATA_PATH)
     if "Label" not in df.columns:
         df["Label"] = 0
-    print(f"  {len(df):,} events (all event types)")
+    n_raw = len(df)
+
+    # EventID filter: keep only high-signal event types
+    FILTER_EVENTIDS = [1, 3]
+    df["EventID"] = pd.to_numeric(df["EventID"], errors="coerce")
+    df = df[df["EventID"].isin(FILTER_EVENTIDS)].reset_index(drop=True)
+    print(f"  {n_raw:,} → {len(df):,} events (EventIDs {FILTER_EVENTIDS})")
 
     # ── 2. feature engineering (handcrafted only) ────────────────────────────
     print("\n[2/5] Feature engineering (handcrafted only, no embeddings)...")
