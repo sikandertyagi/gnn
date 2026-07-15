@@ -76,56 +76,122 @@ SAVE_DIR = os.path.join(ARTIFACTS_DIR, "foundation_model")
 # Event → text conversion
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _clean(val, fallback="") -> str:
+    """Return cleaned string or fallback for NaN / zero-fill / empty."""
+    if val is None or pd.isna(val):
+        return fallback
+    s = str(val).strip()
+    if s in ("", "0", "nan", "-"):
+        return fallback
+    return s
+
+
+def _proc_name(path_str: str) -> str:
+    """Extract lowercase process name from a Windows/Linux path."""
+    if not path_str:
+        return "unknown"
+    return path_str.replace("\\", "/").split("/")[-1].lower()
+
+
 def event_to_text(row: pd.Series) -> str:
     """Convert a Sysmon event row into a structured text string.
 
-    Format is key-value pairs that preserve semantic meaning for the LM.
+    Uses the actual column names from the Sysmon CSV. Includes all
+    high-signal fields for anomaly detection:
+      - process + parent process (name, path, command line)
+      - user context (user, integrity, working directory)
+      - binary metadata (signed, company, original filename)
+      - network info (protocol, source, destination)
+      - host identity
+
     Example output:
-        event:process_create process:powershell.exe parent:cmd.exe
-        user:SYSTEM integrity:high cmdline:powershell -enc ... signed:true
-        dest:192.168.1.1:443
+        host:laptop-01 event:process_create process:powershell.exe
+        parent:cmd.exe user:system\admin integrity:high
+        cmdline:powershell -enc ... parentcmd:cmd /c ...
+        cwd:c:\users\admin\appdata\local\temp signed:false
+        company:unknown originalname:powershell.exe
+        path:c:\windows\system32\windowspowershell\v1.0\powershell.exe
+        dest:192.168.1.1:443 protocol:tcp
     """
     parts = []
 
+    # host
+    host = _clean(row.get("Computer"), "unknown")
+    parts.append(f"host:{host.lower()}")
+
     # event type
-    eid = row.get("EventID", 0)
+    eid = int(float(_clean(row.get("EventID"), "0") or "0"))
     eid_map = {
         1: "process_create", 3: "network_connect", 5: "process_terminate",
         7: "image_load", 10: "process_access", 11: "file_create",
         12: "registry_add", 13: "registry_set", 14: "registry_rename",
     }
-    parts.append(f"event:{eid_map.get(int(eid), f'type_{int(eid)}')}")
+    parts.append(f"event:{eid_map.get(eid, f'type_{eid}')}")
 
     # process info
-    image = str(row.get("Image", "unknown"))
-    proc = image.replace("\\", "/").split("/")[-1].lower() if image != "unknown" else "unknown"
-    parts.append(f"process:{proc}")
+    image = _clean(row.get("Image"), "unknown")
+    parts.append(f"process:{_proc_name(image)}")
 
-    parent = str(row.get("ParentImage", "unknown"))
-    pprc = parent.replace("\\", "/").split("/")[-1].lower() if parent != "unknown" else "unknown"
-    parts.append(f"parent:{pprc}")
+    parent_image = _clean(row.get("ParentImage"), "unknown")
+    parts.append(f"parent:{_proc_name(parent_image)}")
 
-    parts.append(f"user:{str(row.get('User', 'unknown')).lower()}")
-    parts.append(f"integrity:{str(row.get('IntegrityLevel', 'unknown')).lower()}")
+    # user context
+    user = _clean(row.get("User"), "unknown")
+    parts.append(f"user:{user.lower()}")
 
-    # command line (truncate to ~500 chars to fit in token budget)
-    cmdline = str(row.get("CommandLine", ""))
-    if cmdline and cmdline != "nan":
-        cmdline = cmdline[:500]
-        parts.append(f"cmdline:{cmdline}")
+    integrity = _clean(row.get("IntegrityLevel"), "unknown")
+    parts.append(f"integrity:{integrity.lower()}")
+
+    # command line — the single richest field for attack detection
+    cmdline = _clean(row.get("CommandLine"))
+    if cmdline:
+        parts.append(f"cmdline:{cmdline[:400]}")
+
+    # parent command line — crucial for detecting lateral movement / LOLBins
+    parent_cmd = _clean(row.get("ParentCommandLine"))
+    if parent_cmd:
+        parts.append(f"parentcmd:{parent_cmd[:300]}")
+
+    # working directory — temp/downloads dirs are suspicious
+    cwd = _clean(row.get("CurrentDirectory"))
+    if cwd:
+        parts.append(f"cwd:{cwd.lower()[:150]}")
 
     # binary metadata
-    signed = str(row.get("Signed", "false")).lower()
-    parts.append(f"signed:{signed}")
+    signed = _clean(row.get("Signed"), "unknown")
+    parts.append(f"signed:{signed.lower()}")
 
-    # full image path (gives context: temp dir, system32, etc.)
-    parts.append(f"path:{image.lower()[:200]}")
+    company = _clean(row.get("Company"))
+    if company:
+        parts.append(f"company:{company.lower()[:80]}")
 
-    # network
-    dest_ip = row.get("DestinationIp", "")
-    dest_port = row.get("DestinationPort", "")
-    if pd.notna(dest_ip) and str(dest_ip):
+    # original filename — detects renamed binaries (e.g. mimikatz → svchost)
+    orig = _clean(row.get("OriginalFileName"))
+    if orig:
+        parts.append(f"originalname:{orig.lower()}")
+
+    # full image path
+    if image != "unknown":
+        parts.append(f"path:{image.lower()[:200]}")
+
+    # network fields (EventID 3)
+    protocol = _clean(row.get("Protocol"))
+    if protocol:
+        parts.append(f"protocol:{protocol.lower()}")
+
+    src_ip = _clean(row.get("SourceIp"))
+    src_port = _clean(row.get("SourcePort"))
+    if src_ip:
+        parts.append(f"src:{src_ip}:{src_port}")
+
+    dest_ip = _clean(row.get("DestinationIp"))
+    dest_port = _clean(row.get("DestinationPort"))
+    if dest_ip:
         parts.append(f"dest:{dest_ip}:{dest_port}")
+
+    dest_host = _clean(row.get("DestinationHostname"))
+    if dest_host:
+        parts.append(f"desthost:{dest_host.lower()[:100]}")
 
     return " ".join(parts)
 
