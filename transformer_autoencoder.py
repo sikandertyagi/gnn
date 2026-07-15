@@ -101,7 +101,10 @@ class TransformerAutoencoder(nn.Module):
         # decoder to learn a dedicated query space rather than attending directly
         # with raw sinusoidal embeddings, improving reconstruction specificity.
         self.query_proj  = nn.Linear(embed_dim, embed_dim)
-        self.output_proj = nn.Linear(embed_dim, feature_dim)
+        self.output_proj = nn.Sequential(
+            nn.Linear(embed_dim, feature_dim),
+            nn.Sigmoid(),
+        )
 
     # ── public API ────────────────────────────────────────────────────────────
 

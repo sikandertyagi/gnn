@@ -1,19 +1,18 @@
 """
 dense_autoencoder.py
 ────────────────────
-Single-event dense (feedforward) autoencoder.
+Single-event dense (feedforward) autoencoder — December architecture.
 
-Unlike the transformer AE which operates on sliding-window *sequences* of
-events, this model scores each event independently.  A single malicious
-event produces a sharp per-event reconstruction spike that is not diluted
-by the surrounding benign context of a 20-event window.
+Architecture (validated at ROC-AUC 0.9950 standalone)
+──────────────────────────────────────────────────────
+  Encoder: F → 128 → 64 → 32 → 16  (ReLU + LayerNorm)
+  Decoder: 16 → 32 → 64 → 128 → F  (ReLU + LayerNorm, final sigmoid)
 
-Architecture
-────────────
-  Input  : (B, F)   — one feature vector per event
-  Encoder: F → H1 → H2  (with ReLU + BatchNorm)
-  Decoder: H2 → H1 → F  (with ReLU + BatchNorm, final sigmoid)
-  Output : (B, F)
+Key design choices matching December:
+  · LayerNorm (not BatchNorm) — more stable for anomaly detection
+  · Sigmoid output — matches MinMax-scaled [0, 1] inputs exactly
+  · No dropout — December pipeline had none
+  · Adam (not AdamW) with lr=5e-4
 
 Training: MSE(output, input) on benign events only.
 Scoring:  per-event MSE reconstruction error.
@@ -29,6 +28,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from config import (
     DENSE_HIDDEN_DIMS, DENSE_EPOCHS, DENSE_BATCH_SIZE,
     DENSE_LR, DENSE_VAL_RATIO, DENSE_EARLY_STOPPING_PATIENCE,
+    DENSE_LR_PATIENCE, DENSE_LR_FACTOR, DENSE_LR_MIN,
     RANDOM_SEED, TRAIN_LABEL,
 )
 
@@ -36,25 +36,33 @@ from config import (
 class DenseAutoencoder(nn.Module):
 
     def __init__(self, feature_dim: int,
-                 hidden_dims: tuple[int, ...] = DENSE_HIDDEN_DIMS,
-                 dropout: float = 0.1):
+                 hidden_dims: tuple[int, ...] = DENSE_HIDDEN_DIMS):
         super().__init__()
         self.feature_dim = feature_dim
 
-        # encoder
+        # encoder: F → 128 → LN → 64 → LN → 32 → 16 (all ReLU)
         enc_layers = []
         in_dim = feature_dim
-        for h in hidden_dims:
-            enc_layers += [nn.Linear(in_dim, h), nn.BatchNorm1d(h), nn.ReLU(), nn.Dropout(dropout)]
+        for i, h in enumerate(hidden_dims):
+            enc_layers.append(nn.Linear(in_dim, h))
+            enc_layers.append(nn.ReLU())
+            if i < len(hidden_dims) - 2:
+                enc_layers.append(nn.LayerNorm(h))
             in_dim = h
         self.encoder = nn.Sequential(*enc_layers)
 
-        # decoder (mirror)
+        # decoder: 16 → 32 → LN → 64 → LN → 128 → F (sigmoid)
         dec_layers = []
         rev = list(reversed(hidden_dims))
         in_dim = rev[0]
-        for h in list(rev[1:]) + [feature_dim]:
-            dec_layers += [nn.Linear(in_dim, h), nn.BatchNorm1d(h), nn.ReLU(), nn.Dropout(dropout)]
+        for i, h in enumerate(list(rev[1:]) + [feature_dim]):
+            dec_layers.append(nn.Linear(in_dim, h))
+            if h == feature_dim:
+                dec_layers.append(nn.Sigmoid())
+            else:
+                dec_layers.append(nn.ReLU())
+                if i < len(rev) - 2:
+                    dec_layers.append(nn.LayerNorm(h))
             in_dim = h
         self.decoder = nn.Sequential(*dec_layers)
 
@@ -97,7 +105,7 @@ def train_dense_ae(
     device   = torch.device("cuda" if use_cuda else "cpu")
 
     model = DenseAutoencoder(feature_dim).to(device)
-    scaler = torch.amp.GradScaler("cuda", enabled=use_cuda)
+    amp_scaler = torch.amp.GradScaler("cuda", enabled=use_cuda)
 
     _loader_kw = dict(
         num_workers=4 if use_cuda else 0,
@@ -116,10 +124,18 @@ def train_dense_ae(
         vl_loader = DataLoader(vl_ds, batch_size=batch_size * 4,
                                shuffle=False, **_loader_kw)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=DENSE_LR_FACTOR,
+        patience=DENSE_LR_PATIENCE, min_lr=DENSE_LR_MIN,
+    )
     criterion = nn.MSELoss()
+
     print(f"      Dense AE training on {device}  "
           f"({len(X_tr):,} train, {n_val:,} val)")
+    print(f"      Architecture: {feature_dim} → "
+          f"{' → '.join(str(h) for h in DENSE_HIDDEN_DIMS)} → "
+          f"{feature_dim} (sigmoid)")
 
     best_loss  = float("inf")
     best_state = copy.deepcopy(model.state_dict())
@@ -133,11 +149,11 @@ def train_dense_ae(
             optimizer.zero_grad()
             with torch.amp.autocast("cuda", enabled=use_cuda):
                 loss = criterion(model(x), x)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
+            amp_scaler.scale(loss).backward()
+            amp_scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            amp_scaler.step(optimizer)
+            amp_scaler.update()
             total += loss.item()
         tr_loss = total / len(tr_loader)
 
@@ -151,12 +167,20 @@ def train_dense_ae(
                         vl_total += criterion(model(xv), xv).item()
             vl      = vl_total / len(vl_loader)
             monitor = vl
-            print(f"Epoch {epoch+1:>3}/{epochs}  train={tr_loss:.4f}  val={vl:.4f}")
+            if (epoch + 1) % 5 == 0 or epoch == 0:
+                print(f"      Epoch {epoch+1:>3}/{epochs}  "
+                      f"train={tr_loss:.6f}  val={vl:.6f}  "
+                      f"lr={optimizer.param_groups[0]['lr']:.1e}")
         else:
             monitor = tr_loss
-            print(f"Epoch {epoch+1:>3}/{epochs}  loss={tr_loss:.4f}")
+            if (epoch + 1) % 5 == 0 or epoch == 0:
+                print(f"      Epoch {epoch+1:>3}/{epochs}  "
+                      f"loss={tr_loss:.6f}  "
+                      f"lr={optimizer.param_groups[0]['lr']:.1e}")
 
-        if monitor < best_loss:
+        scheduler.step(monitor)
+
+        if monitor < best_loss - 1e-6:
             best_loss  = monitor
             best_state = copy.deepcopy(model.state_dict())
             wait       = 0
@@ -164,10 +188,10 @@ def train_dense_ae(
             wait += 1
             if patience > 0 and wait >= patience:
                 print(f"      Early stopping at epoch {epoch+1}  "
-                      f"(best={best_loss:.4f})")
+                      f"(best={best_loss:.6f})")
                 break
 
-    print(f"      Dense AE training complete  best_loss={best_loss:.4f}")
+    print(f"      Dense AE training complete  best_loss={best_loss:.6f}")
     model.load_state_dict(best_state)
     return model
 

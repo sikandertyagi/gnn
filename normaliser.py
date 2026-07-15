@@ -1,57 +1,42 @@
 """
 normaliser.py
 ─────────────
-Feature normalisation for the transformer autoencoder.
+Feature normalisation using MinMaxScaler.
 
-Why this is necessary
-─────────────────────
-The numeric input features span very different ranges:
-  · cmd_length  – 0 … 32 000+
-  · dest_port   – 0 … 65 535
-  · cmd_entropy – 0 … ~4.5  (bits)
-  · is_signed   – {0, 1}
+Scales numerical features to [0, 1] to match the sigmoid output activation
+of the autoencoders.  OneHotEncoded columns (already in {0, 1}) are skipped.
 
-Without normalisation the transformer reconstruction loss is dominated by
-high-variance features, making it blind to anomalies in low-variance ones.
-
-Design
-──────
-  · StandardScaler fitted on benign (Label == 0) rows ONLY.
-    This mirrors the anomaly-detection assumption: we model normality;
-    attack statistics must not leak into the mean / std.
-  · The first N_CATEGORICAL_FEATURES columns are CRC32-hashed categoricals
-    already in [0, 1].  Z-scoring them is semantically meaningless (their
-    values are arbitrary hashes, not measurements), so the scaler is fitted
-    and applied only to the numeric columns that follow.
-  · Scaler is saved to SCALER_PATH so it can be reloaded for inference.
+MinMaxScaler is fitted on benign (Label == 0) rows ONLY so that attack
+statistics do not leak into the scaling parameters.
 """
 
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import MinMaxScaler
 
 from config import SCALER_PATH, TRAIN_LABEL
-from feature_engineering import N_CATEGORICAL_FEATURES
 
 
-def fit_scaler(df: pd.DataFrame, feature_cols: list) -> StandardScaler:
+def fit_scaler(df: pd.DataFrame, feature_cols: list,
+               n_ohe_cols: int = 0) -> MinMaxScaler:
     """
-    Fit a StandardScaler on the benign subset of *df*, skipping the first
-    N_CATEGORICAL_FEATURES columns (CRC32-hashed, already in [0, 1]).
+    Fit a MinMaxScaler on the benign subset of *df*, skipping the first
+    *n_ohe_cols* columns (OneHotEncoded, already in {0, 1}).
 
     Parameters
     ----------
     df           : full event DataFrame (with Label column)
-    feature_cols : list of all feature column names (categorical + numeric)
+    feature_cols : list of all feature column names (OHE + numeric)
+    n_ohe_cols   : number of OHE columns at the start of feature_cols
 
     Returns
     -------
-    scaler : fitted StandardScaler  (also saved to SCALER_PATH)
+    scaler : fitted MinMaxScaler  (also saved to SCALER_PATH)
     """
-    numeric_cols = feature_cols[N_CATEGORICAL_FEATURES:]
+    numeric_cols = feature_cols[n_ohe_cols:]
     benign = df[df["Label"] == TRAIN_LABEL]
-    scaler = StandardScaler()
+    scaler = MinMaxScaler()
     scaler.fit(benign[numeric_cols].values.astype(np.float32))
     joblib.dump(scaler, SCALER_PATH)
     return scaler
@@ -60,15 +45,16 @@ def fit_scaler(df: pd.DataFrame, feature_cols: list) -> StandardScaler:
 def apply_scaler(
     df: pd.DataFrame,
     feature_cols: list,
-    scaler: StandardScaler,
+    scaler: MinMaxScaler,
+    n_ohe_cols: int = 0,
 ) -> pd.DataFrame:
     """
-    Return *df* with the numeric feature columns replaced by z-score
-    normalised values.  The first N_CATEGORICAL_FEATURES columns (CRC32
-    hashes, already in [0, 1]) are left untouched.
+    Return *df* with the numeric feature columns replaced by MinMax-scaled
+    values in [0, 1].  The first *n_ohe_cols* columns (OHE, already in
+    {0, 1}) are left untouched.
     Does not modify the original DataFrame.
     """
-    numeric_cols = feature_cols[N_CATEGORICAL_FEATURES:]
+    numeric_cols = feature_cols[n_ohe_cols:]
     df = df.copy()
     df[numeric_cols] = scaler.transform(
         df[numeric_cols].values.astype(np.float32)
@@ -76,6 +62,6 @@ def apply_scaler(
     return df
 
 
-def load_scaler() -> StandardScaler:
+def load_scaler() -> MinMaxScaler:
     """Reload a scaler saved by fit_scaler() for inference on new data."""
     return joblib.load(SCALER_PATH)

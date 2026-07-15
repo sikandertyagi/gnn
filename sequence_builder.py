@@ -28,9 +28,9 @@ three host-relative time features before windowing:
   event_burst_count   number of events on the same host in the preceding 60 s
                       (O(n log n) per host via numpy searchsorted)
 
-All three are z-scored on benign rows only (mirroring the StandardScaler
+All three are MinMax-scaled on benign rows only (mirroring the MinMaxScaler
 convention in normaliser.py) so they enter the transformer on the same
-scale as the rest of the feature vector.
+[0, 1] scale as the rest of the feature vector.
 """
 
 import numpy as np
@@ -74,8 +74,8 @@ def _add_temporal_features(df: pd.DataFrame, feature_cols: list) -> tuple:
     Add time_delta_seconds, log_time_delta, and event_burst_count to *df*
     and append them to *feature_cols*.
 
-    All three are z-scored on benign rows only (TRAIN_LABEL) to mirror the
-    StandardScaler convention used for the rest of the feature vector.
+    All three are MinMax-scaled on benign rows only (TRAIN_LABEL) to mirror
+    the MinMaxScaler convention used for the rest of the feature vector.
 
     Parameters
     ----------
@@ -114,13 +114,13 @@ def _add_temporal_features(df: pd.DataFrame, feature_cols: list) -> tuple:
         pd.concat(burst_parts).reindex(df.index).astype(np.float32)
     )
 
-    # ── z-score on benign rows only ───────────────────────────────────────────
+    # ── MinMax scale on benign rows only ─────────────────────────────────────
     benign = df["Label"] == TRAIN_LABEL
     for col in _TEMPORAL_COLS:
-        mu  = float(df.loc[benign, col].mean())
-        sig = float(df.loc[benign, col].std())
-        if sig > 1e-8:
-            df[col] = ((df[col] - mu) / sig).astype(np.float32)
+        mn = float(df.loc[benign, col].min())
+        mx = float(df.loc[benign, col].max())
+        if mx - mn > 1e-8:
+            df[col] = ((df[col] - mn) / (mx - mn)).clip(0.0, 1.0).astype(np.float32)
         else:
             df[col] = np.float32(0.0)
 

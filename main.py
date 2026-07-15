@@ -5,13 +5,13 @@ Full end-to-end pipeline:
 
   Sysmon CSV
     │
-    ▼  EventID filter [1, 3] only  ← applied at load time; all engines
-    │                                  and evaluation use only these two
-    ▼  feature_engineering.py      (vectorised; missing columns filled safely)
+    ▼  EventID filter (optional)
+    │
+    ▼  feature_engineering.py      (OHE for categoricals, metadata features)
   Tabular feature matrix  +  enriched DataFrame
     │
-    ▼  normaliser.py               (StandardScaler fitted on benign rows only)
-  Normalised feature matrix
+    ▼  normaliser.py               (MinMaxScaler fitted on benign rows only)
+  Normalised feature matrix  (all values in [0, 1])
     │
     ├─► graph_builder.py           → HeteroData graph
     │       │
@@ -136,15 +136,16 @@ def main():
     use_memmap = n_events > LARGE_DATASET_THRESHOLD
     print(f"      {'large (memmap)' if use_memmap else 'small (in-memory)'} mode")
 
-    # ── 2. feature engineering ────────────────────────────────────────────────
-    print("\n[2/10] Feature engineering...")
-    df, feature_cols = feature_engineering(df)
-    print(f"      {len(feature_cols)} feature columns")
+    # ── 2. feature engineering (December: OHE + metadata features) ──────────
+    print("\n[2/10] Feature engineering (OHE + metadata)...")
+    df, feature_cols, n_ohe_cols = feature_engineering(df)
+    print(f"      {len(feature_cols)} feature columns "
+          f"({n_ohe_cols} OHE + {len(feature_cols) - n_ohe_cols} numerical)")
 
-    # ── 3. normalise features (benign-fit StandardScaler) ─────────────────────
-    print("\n[3/10] Fitting StandardScaler on benign rows...")
-    scaler = fit_scaler(df, feature_cols)
-    df     = apply_scaler(df, feature_cols, scaler)
+    # ── 3. normalise features (benign-fit MinMaxScaler) ──────────────────────
+    print("\n[3/10] Fitting MinMaxScaler on benign rows...")
+    scaler = fit_scaler(df, feature_cols, n_ohe_cols=n_ohe_cols)
+    df     = apply_scaler(df, feature_cols, scaler, n_ohe_cols=n_ohe_cols)
     print(f"      Scaler saved → scaler.pkl")
 
     # ── 4. build heterogeneous event graph ────────────────────────────────────
@@ -208,7 +209,7 @@ def main():
 
     # ── 9. sequences + transformer autoencoder ────────────────────────────────
     print(f"\n[9/10] Building sequences & training Transformer autoencoder...")
-    print(f"      {n_events:,} events (EventIDs {HIGH_SIGNAL_EVENTIDS} only)")
+    print(f"      {n_events:,} events")
 
     if use_memmap:
         # ── large-dataset path ────────────────────────────────────────────────
