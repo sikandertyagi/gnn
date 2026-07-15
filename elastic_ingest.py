@@ -28,6 +28,7 @@ Usage
   python elastic_ingest.py                         # uses elastic_config.yml
   python elastic_ingest.py --config /path/to/cfg.yml
   python elastic_ingest.py --dry-run               # print counts, skip CSV save
+  python elastic_ingest.py --resume --eval-only    # append eval window to existing CSV
 
 Environment variable overrides (highest priority)
 ──────────────────────────────────────────────────
@@ -290,6 +291,7 @@ def main(
     config_path: str = "elastic_config.yml",
     dry_run: bool = False,
     resume: bool = False,
+    eval_only: bool = False,
 ) -> None:
     cfg = _load_config(config_path)
 
@@ -324,11 +326,23 @@ def main(
         log.info("[DRY-RUN] Skipping Elasticsearch connection.")
         return
 
+    # ── eval-only mode ──────────────────────────────────────────────────────
+    if eval_only:
+        if not Path(output_path).exists() or Path(output_path).stat().st_size == 0:
+            log.error("--eval-only requires an existing CSV with training data at %s",
+                      output_path)
+            sys.exit(1)
+        log.info("═" * 62)
+        log.info("  EVAL-ONLY mode: skipping training window entirely")
+        log.info("  Appending eval data [%s → %s] to existing CSV", eval_start, eval_end)
+        log.info("═" * 62)
+        resume = True  # prevent file deletion, append mode
+
     # ── resume detection ─────────────────────────────────────────────────────
-    skip_train = False
+    skip_train = eval_only
     adjusted_start: Optional[str] = None
 
-    if resume:
+    if resume and not eval_only:
         state = _detect_resume_state(output_path)
         if state:
             log.info("")
@@ -455,5 +469,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Resume from a previous interrupted run instead of starting over",
     )
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Skip training window; append only the eval window to the existing CSV",
+    )
     args = parser.parse_args()
-    main(config_path=args.config, dry_run=args.dry_run, resume=args.resume)
+    main(config_path=args.config, dry_run=args.dry_run, resume=args.resume,
+         eval_only=args.eval_only)
