@@ -572,6 +572,11 @@ def main():
     print("\n[2/6] Converting events to text...")
     texts = events_to_texts(df)
 
+    # save event texts for inspection / reuse
+    texts_path = os.path.join(SAVE_DIR, "event_texts.csv")
+    pd.DataFrame({"label": labels, "text": texts}).to_csv(texts_path, index=False)
+    print(f"  Saved → {texts_path}")
+
     # ── 3. tokenize ──────────────────────────────────────────────────────────
     print("\n[3/6] Tokenizing...")
     tokenizer = DistilBertTokenizerFast.from_pretrained(MODEL_NAME)
