@@ -154,7 +154,7 @@ def _why_suspicious(row: pd.Series) -> list[str]:
 def _format_event(idx: int, rank: int, ev: pd.Series) -> str:
     """Return a multi-line string with full details for one flagged event."""
 
-    eid      = int(ev.get("EventID", 0))
+    eid      = int(float(ev.get("EventID", 0)))
     eid_name = {1: "Process Creation", 3: "Network Connection"}.get(eid, f"EventID {eid}")
 
     score  = ev.get("score",        float("nan"))
