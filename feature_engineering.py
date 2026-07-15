@@ -1,23 +1,26 @@
 """
 feature_engineering.py
 ──────────────────────
-Converts raw Sysmon CSV rows into a numeric feature matrix using the
-December pipeline approach: OneHotEncoding for categoricals + MinMaxScaler
-for numericals.
+Converts raw Sysmon CSV rows into a numeric feature matrix.
 
-This approach was validated to achieve ROC-AUC 0.9950 as a standalone
-dense autoencoder — significantly outperforming the previous CRC32 hashing
-+ StandardScaler approach.
+Encoding strategy
+─────────────────
+  High-cardinality columns (Computer, DestinationPortName):
+    → frequency encoding  (proportion of events with that value)
+    → hash-bucket encoding (deterministic fixed-width binary features)
+    → well-known port flag (DestinationPortName only)
 
-Feature set (15 metadata features)
-──────────────────────────────────
-  Categorical (OHE):
-    Computer, DestinationPortName, EventID, Initiated, SourceIsIpv6,
-    SystemTime_year, SystemTime_month, SystemTime_week, SystemTime_day_of_week
+  Low-cardinality columns (EventID, Initiated, SourceIsIpv6, time parts):
+    → OneHotEncoding  (small, bounded number of unique values)
 
-  Numerical (MinMaxScaler):
-    EventRecordID, Execution_ProcessID, ProcessId,
-    SystemTime_day, SystemTime_hour, SystemTime_minute
+  Numerical columns:
+    → passed through as-is (MinMaxScaler applied later by normaliser.py)
+
+Feature column ordering
+───────────────────────
+  Binary columns first (OHE + hash buckets + flags), then float columns
+  (frequencies + numericals).  The count of leading binary columns is
+  returned as n_binary_cols so the normaliser knows which to skip.
 
 Rarity engine columns
 ─────────────────────
@@ -29,6 +32,7 @@ Rarity engine columns
 import os
 import re
 import warnings
+import zlib
 
 import joblib
 import numpy as np
@@ -39,12 +43,14 @@ from config import ARTIFACTS_DIR
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Feature definitions — same 15 as December preprocessing.py
+# Column classifications
 # ─────────────────────────────────────────────────────────────────────────────
 
-CATEGORICAL_COLS = [
-    'Computer', 'DestinationPortName', 'EventID', 'Initiated',
-    'SourceIsIpv6', 'SystemTime_year', 'SystemTime_month',
+HIGH_CARDINALITY_COLS = ['Computer', 'DestinationPortName']
+
+LOW_CARDINALITY_COLS = [
+    'EventID', 'Initiated', 'SourceIsIpv6',
+    'SystemTime_year', 'SystemTime_month',
     'SystemTime_week', 'SystemTime_day_of_week',
 ]
 
@@ -53,7 +59,25 @@ NUMERICAL_COLS = [
     'SystemTime_day', 'SystemTime_hour', 'SystemTime_minute',
 ]
 
-OHE_PATH = os.path.join(ARTIFACTS_DIR, "ohe_encoder.pkl")
+# Hash bucket counts per high-cardinality column
+HASH_BUCKETS = {
+    'Computer': 16,
+    'DestinationPortName': 8,
+}
+
+WELL_KNOWN_PORTS = frozenset({
+    'HTTP', 'HTTPS', 'DNS', 'SSH', 'RDP', 'SMB', 'SMTP', 'IMAP', 'POP3',
+    'FTP', 'LDAP', 'LDAPS', 'Kerberos', 'NTP', 'SNMP', 'DHCP',
+    'WinRM', 'WMI', 'MSSQL', 'MySQL', 'PostgreSQL', 'Redis',
+    'Syslog', 'TFTP', 'Telnet',
+    'http', 'https', 'dns', 'ssh', 'rdp', 'smb', 'smtp', 'imap', 'pop3',
+    'ftp', 'ldap', 'ldaps', 'kerberos', 'ntp', 'snmp', 'dhcp',
+    'winrm', 'wmi', 'mssql', 'mysql', 'postgresql', 'redis',
+    'syslog', 'tftp', 'telnet',
+})
+
+OHE_PATH  = os.path.join(ARTIFACTS_DIR, "ohe_encoder.pkl")
+FREQ_PATH = os.path.join(ARTIFACTS_DIR, "freq_maps.pkl")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Optional Sysmon columns and their safe defaults
@@ -96,6 +120,34 @@ def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Encoding helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _hash_bucket(value: str, n_buckets: int) -> int:
+    """Deterministic hash → bucket index. Uses CRC32 (stable across sessions)."""
+    return zlib.crc32(value.encode('utf-8', errors='replace')) % n_buckets
+
+
+def _build_freq_map(series: pd.Series) -> dict:
+    """Build a {value: proportion} mapping from a Series."""
+    counts = series.value_counts(normalize=True)
+    return counts.to_dict()
+
+
+def _apply_freq_encoding(series: pd.Series, freq_map: dict) -> np.ndarray:
+    """Map series values to their frequency proportion (0.0 for unseen)."""
+    return series.map(freq_map).fillna(0.0).values.astype(np.float32)
+
+
+def _apply_hash_encoding(series: pd.Series, n_buckets: int) -> np.ndarray:
+    """Map series values to a fixed-width binary matrix via hash bucketing."""
+    bucket_ids = series.apply(lambda v: _hash_bucket(str(v), n_buckets)).values
+    result = np.zeros((len(series), n_buckets), dtype=np.float32)
+    result[np.arange(len(series)), bucket_ids] = 1.0
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Public helpers (kept for graph_builder / rarity_engine imports)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -119,11 +171,11 @@ def feature_engineering(df: pd.DataFrame):
     Returns
     -------
     df           : DataFrame with added columns (time features, process names,
-                   OHE binary columns)
+                   encoded features)
     feature_cols : list[str] — names of feature columns for the model
-                   (OHE columns first, then numerical columns)
-    n_ohe_cols   : int — number of OHE columns at the start of feature_cols
-                   (these are already in {0,1} and should NOT be scaled)
+                   (binary columns first, then float columns)
+    n_ohe_cols   : int — number of binary columns at the start of feature_cols
+                   (OHE + hash buckets + flags; already in {0,1}, skip scaling)
     """
     df = df.copy()
     df = _ensure_columns(df)
@@ -153,19 +205,65 @@ def feature_engineering(df: pd.DataFrame):
     df["SystemTime_day_of_week"] = ts.dt.dayofweek.fillna(0).astype(int)
 
     # ── clean categoricals ────────────────────────────────────────────────────
-    cat_cols = [c for c in CATEGORICAL_COLS if c in df.columns]
-    for col in cat_cols:
-        df[col] = (
-            df[col].astype(str)
-            .replace(['nan', 'NaN', 'NULL', 'null', 'None', '-'], 'Unknown')
-            .fillna('Unknown')
-        )
+    all_cat_cols = HIGH_CARDINALITY_COLS + LOW_CARDINALITY_COLS
+    for col in all_cat_cols:
+        if col in df.columns:
+            df[col] = (
+                df[col].astype(str)
+                .replace(['nan', 'NaN', 'NULL', 'null', 'None', '-'], 'Unknown')
+                .fillna('Unknown')
+            )
 
-    # ── OneHotEncode categoricals ─────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # A. HIGH-CARDINALITY COLUMNS → frequency + hash encoding
+    # ══════════════════════════════════════════════════════════════════════════
+    freq_maps = {}
+    hash_binary_names = []
+    freq_col_names = []
+
+    for col in HIGH_CARDINALITY_COLS:
+        if col not in df.columns:
+            continue
+
+        n_unique = df[col].nunique()
+        n_buckets = HASH_BUCKETS.get(col, 8)
+
+        # frequency encoding
+        fmap = _build_freq_map(df[col])
+        freq_maps[col] = fmap
+        freq_name = f"{col}_freq"
+        df[freq_name] = _apply_freq_encoding(df[col], fmap)
+        freq_col_names.append(freq_name)
+
+        # hash-bucket encoding
+        hash_matrix = _apply_hash_encoding(df[col], n_buckets)
+        bucket_names = [f"{col}_hash_{i}" for i in range(n_buckets)]
+        for i, bname in enumerate(bucket_names):
+            df[bname] = hash_matrix[:, i]
+        hash_binary_names.extend(bucket_names)
+
+        print(f"      {col}: {n_unique:,} unique values → "
+              f"1 freq + {n_buckets} hash buckets")
+
+    joblib.dump(freq_maps, FREQ_PATH)
+
+    # well-known port flag
+    flag_names = []
+    if 'DestinationPortName' in df.columns:
+        df['port_is_wellknown'] = (
+            df['DestinationPortName'].isin(WELL_KNOWN_PORTS).astype(np.float32)
+        )
+        flag_names.append('port_is_wellknown')
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # B. LOW-CARDINALITY COLUMNS → OneHotEncoding
+    # ══════════════════════════════════════════════════════════════════════════
+    cat_cols = [c for c in LOW_CARDINALITY_COLS if c in df.columns]
     ohe = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
     X_cat = ohe.fit_transform(df[cat_cols])
     ohe_feature_names = list(ohe.get_feature_names_out(cat_cols))
-    print(f"      OHE: {len(cat_cols)} categorical cols → {len(ohe_feature_names)} binary features")
+    print(f"      OHE: {len(cat_cols)} low-cardinality cols → "
+          f"{len(ohe_feature_names)} binary features")
 
     joblib.dump(ohe, OHE_PATH)
 
@@ -177,12 +275,17 @@ def feature_engineering(df: pd.DataFrame):
     for col in num_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
-    # ── feature column list (OHE first, then numericals) ──────────────────────
-    feature_cols = ohe_feature_names + num_cols
-    n_ohe_cols = len(ohe_feature_names)
+    # ══════════════════════════════════════════════════════════════════════════
+    # C. ASSEMBLE feature_cols: binary first, then floats
+    # ══════════════════════════════════════════════════════════════════════════
+    binary_cols = ohe_feature_names + hash_binary_names + flag_names
+    float_cols = freq_col_names + num_cols
+
+    feature_cols = binary_cols + float_cols
+    n_ohe_cols = len(binary_cols)
 
     print(f"      Total features: {len(feature_cols)} "
-          f"({n_ohe_cols} OHE + {len(num_cols)} numerical)")
+          f"({n_ohe_cols} binary + {len(float_cols)} float)")
 
     return df, feature_cols, n_ohe_cols
 
