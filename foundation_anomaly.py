@@ -94,7 +94,7 @@ def _proc_name(path_str: str) -> str:
 
 
 def event_to_text(row: pd.Series) -> str:
-    """Convert a Sysmon event row into a structured text string.
+    r"""Convert a Sysmon event row into a structured text string.
 
     Uses the actual column names from the Sysmon CSV. Includes all
     high-signal fields for anomaly detection:
