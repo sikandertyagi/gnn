@@ -1,4 +1,4 @@
-# Architecture Reference — Sysmon Anomaly Detection Pipeline
+# Architecture Reference — Endpoint Anomaly Detection Pipeline
 
 This document is the authoritative description of the pipeline. It is written
 so that any reader — human or AI tool — with no prior context can understand
@@ -11,68 +11,80 @@ connect**. Every section reflects the current code exactly.
 
 1. [System Goal](#1-system-goal)
 2. [End-to-End Data Flow](#2-end-to-end-data-flow)
-3. [Feature Vector Specification](#3-feature-vector-specification)
-4. [File Reference](#4-file-reference)
-5. [Composite Scoring Formula](#5-composite-scoring-formula)
-6. [Key Design Decisions](#6-key-design-decisions)
-7. [Artifacts on Disk](#7-artifacts-on-disk)
-8. [Configuration Quick Reference](#8-configuration-quick-reference)
-9. [How to Run](#9-how-to-run)
+3. [Data Ingestion](#3-data-ingestion)
+4. [Feature Vector Specification](#4-feature-vector-specification)
+5. [File Reference](#5-file-reference)
+6. [Composite Scoring Formula](#6-composite-scoring-formula)
+7. [Key Design Decisions](#7-key-design-decisions)
+8. [Artifacts on Disk](#8-artifacts-on-disk)
+9. [Configuration Quick Reference](#9-configuration-quick-reference)
+10. [How to Run](#10-how-to-run)
 
 ---
 
 ## 1. System Goal
 
 Detect cyber-attack activity (malware execution, C2 communication, privilege
-escalation, lateral movement) in Windows Sysmon event logs — **without relying
+escalation, lateral movement) in Windows endpoint telemetry — **without relying
 on signatures and without requiring labelled attack data at training time**.
+
+The pipeline ingests data from Elasticsearch (Elastic Defend, Sysmon via
+Winlogbeat, or Wazuh) and processes it through multiple anomaly detection models.
 
 The fundamental principle:
 
 > *Train every model exclusively on normal (benign) behaviour. Anything the
 > model cannot reconstruct or has never seen before is, by definition, anomalous.*
 
-Three complementary anomaly signals are computed independently and fused into a
+Four complementary anomaly signals are computed independently and fused into a
 single `composite_score` in [0, 1] per event.
 
-| Signal | Module | What it measures |
-|---|---|---|
-| `recon_error` | `transformer_autoencoder.py` | How poorly the Transformer reconstructs a 20-event sequence |
-| `rarity_score` | `rarity_engine.py` | How rare the process-lineage / destination-IP patterns are vs benign baseline |
-| `graph_score` | `gnn_encoder.py` | How anomalous a process node is in the system-call graph (weight=0, see §5) |
+| Signal | Module | What it measures | Weight |
+|---|---|---|---|
+| `dense_error` | `dense_autoencoder.py` | How poorly a single-event dense AE reconstructs the event | 0.50 |
+| `rarity_score` | `rarity_engine.py` | How rare the process-lineage / destination-IP patterns are vs benign baseline | 0.30 |
+| `recon_error` | `transformer_autoencoder.py` | How poorly the Transformer reconstructs a 20-event sequence | 0.20 |
+| `graph_score` | `gnn_encoder.py` | How anomalous a process node is in the system-call graph | 0.00 (disabled) |
 
 ---
 
 ## 2. End-to-End Data Flow
 
 ```
-sysmondataless.csv  (raw Sysmon telemetry, one row per event)
+Elasticsearch (Elastic Defend / Sysmon / Wazuh)
         │
-        ▼  main.py — step 1: LOAD + EventID filter
+        ▼  elastic_ingest.py — DATA INGESTION
         │
-        │  Keep only EventID 1 (process creation) and EventID 3 (network
-        │  connection).  All three engines, training, inference, and evaluation
-        │  operate on this same filtered subset.  Other event types (module loads,
-        │  registry writes, terminations) dilute signal — transformer AUC ≈ 0.50
-        │  without the filter.
-        │  DataFrame index is reset to a contiguous 0..N-1 RangeIndex.
+        │  Connects to Elasticsearch via elastic_connector.py.
+        │  Fetches training data (Nov 2025) → Label=0 (benign baseline)
+        │  Fetches evaluation data (Jan 17–25 2026) → Label=2 (unlabelled, to-be-predicted)
+        │  Streams to CSV in chunks (memory-efficient).
+        │
+        ▼  elastic_data.csv  (combined CSV, one row per event)
+        │
+        ▼  main.py — step 1: LOAD
+        │
+        │  Optional EventID filter (configurable via HIGH_SIGNAL_EVENTIDS).
+        │  DataFrame index reset to contiguous 0..N-1 RangeIndex.
         │
         ▼  main.py — step 2: FEATURE ENGINEERING  (feature_engineering.py)
         │
-        │  Raw Sysmon columns → 57-column numeric feature matrix.
-        │  Sections:
-        │    · Process identity  (CRC32-hashed names, rare_process_score)
-        │    · Handcrafted command-line flags  (entropy, base64, IP, download, -enc)
-        │    · Semantic command-line embeddings  cmd_emb_0…31  ← NEW
-        │      (all-MiniLM-L6-v2 → 384-d → PCA-32, cached on disk)
-        │    · EventID, path depth, binary metadata, network, time-of-day
+        │  Raw event columns → fixed-width numeric feature matrix.
+        │  Encoding strategy:
+        │    · High-cardinality cols (Computer, DestinationPortName):
+        │        frequency encoding + CRC32 hash-bucket encoding + flags
+        │    · Low-cardinality cols (EventID, Initiated, SourceIsIpv6, time parts):
+        │        OneHotEncoding (bounded unique values)
+        │    · Numerical cols: passed through as-is
+        │
+        │  Feature dimension is FIXED regardless of fleet size.
         │
         ▼  main.py — step 3: NORMALISATION  (normaliser.py)
         │
-        │  StandardScaler fitted on benign rows (Label==0) only.
-        │  First 6 columns (CRC32 hashes + rare_process_score) are skipped
-        │  because they are already in [0, 1].
-        │  cmd_emb_* and all other numeric cols are z-scored.
+        │  MinMaxScaler fitted on benign rows (Label==0) only.
+        │  Binary columns (OHE + hash buckets + flags) are skipped —
+        │  already in {0, 1}.
+        │  Float columns (frequencies + numericals) are scaled to [0, 1].
         │
         ├──────────────────────────────────────────────────────┐
         │                                                      │
@@ -91,162 +103,221 @@ sysmondataless.csv  (raw Sysmon telemetry, one row per event)
         │  Trained on benign-only graph (self-supervised       │  → event_rarity_scores
         │  node-feature MSE reconstruction).                   │    (N_events,) ∈ [0,1]
         │                                                      │
-        │  Inference: benign node features + full topology.   │
-        │  Per-process MSE → mapped back to events.            │
-        │                                                      │
         │  → event_graph_scores (N_events,) ∈ [0,1]          │
         │                                                      │
-        └──────────────────┬───────────────────────────────────┘
-                           │
-                           ▼  main.py — step 8: TRANSFORMER PATH
-                           │
-                           │  sequence_builder.py
-                           │  1. _add_temporal_features():
-                           │       · time_delta_seconds  (diff per host, clipped ≥ 0)
-                           │       · log_time_delta       (log1p of above)
-                           │       · event_burst_count   (events on host in prev 60 s)
-                           │       All three z-scored on benign rows.
-                           │       feature_cols grows from 57 → 60.
-                           │
-                           │  2. Sliding windows (seq_len=20) per host:
-                           │       Small path  (<200k events): in-memory ndarray
-                           │       Large path  (≥200k events): np.memmap on disk
-                           │
-                           │  transformer_autoencoder.py  (TransformerAutoencoder)
-                           │  Trained on benign sequences only.  MSE loss.
-                           │  Architecture:
-                           │    input_proj + LayerNorm
-                           │    → sinusoidal PE
-                           │    → TransformerEncoder (2 layers, 4 heads)
-                           │    → mean-pool → bottleneck (96 → 24)
-                           │    → expand (24 → 96)
-                           │    → positional query tokens → query_proj
-                           │    → TransformerDecoder (cross-attention on encoder memory)
-                           │    → output_proj
-                           │
-                           │  evaluate.py
-                           │  Batched inference → MSE per sequence.
-                           │  Score alignment: seq j belongs to last event in window j.
-                           │  First 19 events per host → NaN (warmup, no full window).
-                           │
-                           │  → event_recon_errors (N_events,)  NaN for warmup events
-                           │
-                           ▼  main.py — step 9: COMPOSITE SCORING
-                           │
-                           │  anomaly_engine.py
-                           │  Each signal is min-max normalised on benign rows.
-                           │  composite = 0.45·recon + 0.00·graph + 0.55·rarity
-                           │  Warmup events: composite = rarity_score
-                           │
-                           ▼  alert_aggregator.py
-                           │
-                           │  Flag events with score ≥ 0.40.
-                           │  Group consecutive flagged events (gap ≤ 300 s) per host
-                           │  → "attack chains"
-                           │  → alerts.csv
-                           │
-                           ▼  metrics.py
-                           │
-                           │  ROC-AUC, PR-AUC, F1, threshold sweep,
-                           │  per-component ablation AUCs, alert-level metrics.
-                           │  → metrics.json, roc_curve.csv, pr_curve.csv, …
+        ├──────────────────────┬───────────────────────────────┘
+        │                      │
+        ▼  step 8: DENSE AE    ▼  step 9: TRANSFORMER PATH
+        │                      │
+        │  dense_autoencoder   │  sequence_builder.py
+        │  Single-event dense  │  1. _add_temporal_features():
+        │  autoencoder.        │       · time_delta_seconds
+        │  Trained on benign   │       · log_time_delta
+        │  events only.        │       · event_burst_count
+        │  Architecture:       │     All three z-scored on benign rows.
+        │  F→128→64→32→16      │
+        │  16→32→64→128→F      │  2. Sliding windows (seq_len=20) per host:
+        │  (LayerNorm + ReLU,  │       Small path (<200k): in-memory ndarray
+        │   final sigmoid)     │       Large path (≥200k): np.memmap on disk
+        │                      │
+        │  → event_dense_errors│  transformer_autoencoder.py
+        │    (N_events,)       │  Trained on benign sequences only.  MSE loss.
+        │                      │
+        │                      │  → event_recon_errors (N_events,)
+        │                      │    NaN for warmup events
+        │                      │
+        └──────────┬───────────┘
+                   │
+                   ▼  main.py — step 10: COMPOSITE SCORING
+                   │
+                   │  anomaly_engine.py
+                   │  Each signal min-max normalised on benign rows.
+                   │  composite = 0.50·dense + 0.20·recon + 0.00·graph + 0.30·rarity
+                   │  Warmup events: recon weight redistributed to remaining signals.
+                   │
+                   ▼  alert_aggregator.py
+                   │
+                   │  Flag events with score ≥ threshold (p97.5 of benign scores).
+                   │  Group consecutive flagged events (gap ≤ 300 s) per host
+                   │  → "attack chains"
+                   │  → alerts.csv
+                   │
+                   ▼  anomaly_report.py
+                   │
+                   │  anomaly_report.txt  → narrative triage report
+                   │  flagged_events.csv  → all flagged rows with context
+                   │
+                   ▼  metrics.py  (only when HAS_GROUND_TRUTH = True)
+                   │
+                   │  ROC-AUC, PR-AUC, F1, threshold sweep,
+                   │  per-component ablation AUCs, alert-level metrics.
+                   │  → metrics.json, roc_curve.csv, pr_curve.csv, …
 ```
 
 ---
 
-## 3. Feature Vector Specification
+## 3. Data Ingestion
 
-Total: **60 features** per event, in this exact order in `feature_cols`.
+### `elastic_ingest.py`
 
-### Section A — CRC32-hashed categoricals (indices 0–5)
-Not z-scored. Already in [0, 1]. Skipped by the StandardScaler
-(`N_CATEGORICAL_FEATURES = 6` in `feature_engineering.py`).
+One-shot data preparation script that pulls endpoint telemetry from
+Elasticsearch and writes the combined CSV consumed by `main.py`.
 
-| Index | Name | Source | How computed |
-|---|---|---|---|
-| 0 | `process_name` | `Image` | Backslash-split + lowercase + CRC32/0xFFFFFFFF |
-| 1 | `parent_process` | `ParentImage` | Same |
-| 2 | `parent_child` | `ParentImage`, `Image` | `"parent->child"` string → CRC32 |
-| 3 | `User` | `User` | CRC32 of username |
-| 4 | `IntegrityLevel` | `IntegrityLevel` | CRC32 of level string |
-| 5 | `rare_process_score` | `Image` | `1 / freq(process_name)` in dataset; (0, 1] |
+**Usage:**
+```bash
+python elastic_ingest.py                         # uses elastic_config.yml
+python elastic_ingest.py --config /path/to/cfg.yml
+python elastic_ingest.py --dry-run               # print config only
+python elastic_ingest.py --resume                # resume interrupted run
+python elastic_ingest.py --eval-only             # append eval window to existing CSV
+```
 
-### Section B — Handcrafted command-line features (indices 6–13)
-Z-scored by StandardScaler (benign fit).
+**Streaming architecture:** Results are written to CSV in chunks as they arrive
+from Elasticsearch (`_stream_window_to_csv`), never holding more than one page
+(~5,000 rows) in memory. Each chunk filters to EventID 1 (process creation)
+and EventID 3 (network connection), drops rows with empty `Image` fields.
 
-| Index | Name | Description |
+**Label semantics:**
+
+| Label | Meaning | Used for |
 |---|---|---|
-| 6 | `cmd_length` | Character length of `CommandLine` |
-| 7 | `cmd_token_count` | Space-delimited token count |
-| 8 | `has_base64` | 1 if regex matches base64 blob ≥ 20 chars |
-| 9 | `has_http` | 1 if "http" (case-insensitive) in command |
-| 10 | `has_ip` | 1 if bare IPv4 address (`\b\d+\.\d+\.\d+\.\d+\b`) found |
-| 11 | `has_download` | 1 if wget / curl / iwr / DownloadString / BITSAdmin etc. found |
-| 12 | `has_encodedcommand` | 1 if `-enc` or `-EncodedCommand` flag present |
-| 13 | `cmd_entropy` | Shannon entropy of character distribution |
+| 0 | Benign / training period | All models trained exclusively on this |
+| 1 | Confirmed attack | Set manually via `relabel_anomalies.py`; enables AUC/F1 metrics |
+| 2 | Unlabelled / to-be-predicted | Scored against Label=0 baseline; never trained on |
 
-### Section C — Semantic command-line embeddings (indices 14–45) ← NEW
-Z-scored by StandardScaler. Added by `commandline_embedding.embed_commandlines`.
+**`--resume` mode:** Reads the existing output CSV to determine where the
+previous run stopped (max timestamp + 1ms). If `last_label == 0`, resumes
+training window. If `last_label == 2`, skips training and resumes eval window.
+No separate checkpoint file — the CSV itself is the state record.
 
-| Index | Name | Description |
+**`--eval-only` mode:** Skips the training window entirely and appends only
+the evaluation window to the existing CSV. Use when training data is complete
+and you want to add a new eval period without re-fetching training data.
+
+### `elastic_connector.py`
+
+Low-level Elasticsearch client supporting three data source types:
+
+| Source | Index patterns | Field namespace |
 |---|---|---|
-| 14–45 | `cmd_emb_0` … `cmd_emb_31` | PCA-32 projection of all-MiniLM-L6-v2 384-d sentence embedding |
+| Sysmon (Winlogbeat) | `winlogbeat-*`, `logs-windows.sysmon_operational-*` | `winlog.event_data.*` |
+| Elastic Defend | `logs-endpoint.events.process-*`, `logs-endpoint.events.network-*` | `process.*`, `destination.*` (ECS) |
+| Wazuh | `wazuh-alerts-4.x-*`, `wazuh-archives-4.x-*` | `data.win.eventdata.*` |
 
-### Section D — Execution path features (indices 46–49)
-Z-scored.
+**Output schema (14 columns):**
+`EventID, Image, ParentImage, CommandLine, User, Computer, SystemTime,
+DestinationIp, DestinationPort, ProcessGuid, ParentProcessGuid,
+IntegrityLevel, Company, Signed`
 
-| Index | Name | Description |
-|---|---|---|
-| 46 | `path_depth` | Slash/backslash count in `Image` |
-| 47 | `is_system_bin` | 1 if path matches system directories (system32, /usr/bin, /usr/sbin, /bin, /sbin) |
-| 48 | `is_users_dir` | 1 if path matches user directories (\\users\\, /home/) |
-| 49 | `is_temp_exec` | 1 if path matches temp/writable directories (temp, /tmp, /var/tmp, /dev/shm, appdata, downloads, programdata) |
+**Features:** `search_after` pagination, retry with exponential backoff (up to
+6 retries), row normalisation with schema defaults, deduplication by
+`(Computer, SystemTime, Image, EventID)`.
 
-### Section E — Binary metadata (indices 50–51)
-Z-scored.
+### `elastic_config.yml`
 
-| Index | Name | Description |
-|---|---|---|
-| 50 | `is_signed` | 1 if `Signed == "true"` |
-| 51 | `missing_company` | 1 if `Company` is NaN |
+YAML configuration for ingestion. All values can be overridden by environment
+variables (`ES_HOST`, `ES_USERNAME`, `ES_PASSWORD`, etc.).
 
-### Section F — Network features (indices 52–53)
-Z-scored.
+Key sections:
+- Connection (host, credentials, TLS, page_size)
+- Data sources (`defend`, `sysmon`, `wazuh` — mix and match)
+- Date windows (`train_start/end`, `eval_start/end`)
+- Output path
 
-| Index | Name | Description |
-|---|---|---|
-| 52 | `dest_port` | `DestinationPort` numeric (0 for non-network events) |
-| 53 | `dest_external` | 1 if destination IP is outside RFC 1918 / loopback |
+### `diagnose_elastic.py`
 
-### Section G — Time-of-day features (indices 54–55)
-Z-scored.
-
-| Index | Name | Description |
-|---|---|---|
-| 54 | `hour` | Hour of day from `SystemTime` (0–23) |
-| 55 | `is_after_hours` | 1 if `hour < 7` or `hour > 19` |
-
-### Section H — Event type (index 56)
-Z-scored.
-
-| Index | Name | Description |
-|---|---|---|
-| 56 | `eventid` | Sysmon EventID integer (1 or 3 after global filter) |
-
-### Section I — Temporal behaviour features (indices 57–59) ← NEW
-Added by `sequence_builder._add_temporal_features` **after** the StandardScaler
-runs. Z-scored on benign rows inside `_add_temporal_features` using the same
-convention.
-
-| Index | Name | Formula | Notes |
-|---|---|---|---|
-| 57 | `time_delta_seconds` | `diff(SystemTime)` per host, clipped ≥ 0 | 0 for first event per host |
-| 58 | `log_time_delta` | `log1p(time_delta_seconds)` | Compresses multi-hour idle gaps |
-| 59 | `event_burst_count` | Events on same host in [t−60s, t) | O(n log n) via `numpy.searchsorted` |
+Diagnostic tool for debugging zero-result queries. Runs progressively more
+targeted queries against Elasticsearch and prints exactly what ES returns.
 
 ---
 
-## 4. File Reference
+## 4. Feature Vector Specification
+
+Total feature count is **fixed regardless of fleet size**. The exact number
+depends on the low-cardinality column value counts, but the high-cardinality
+columns produce a constant number of features.
+
+### Column ordering: binary columns first, then float columns
+
+The first `n_binary_cols` columns in `feature_cols` are binary ({0, 1}) and
+skipped by the MinMaxScaler. The remaining columns are floats that get scaled.
+
+### Section A — Low-cardinality OHE (binary, not scaled)
+
+OneHotEncoded columns for bounded-cardinality categoricals:
+
+| Source column | Typical unique values |
+|---|---|
+| `EventID` | 2 (EID 1 and 3) |
+| `Initiated` | 2–3 |
+| `SourceIsIpv6` | 2–3 |
+| `SystemTime_year` | 1–2 |
+| `SystemTime_month` | 2–4 |
+| `SystemTime_week` | 4–8 |
+| `SystemTime_day_of_week` | 7 |
+
+### Section B — Hash-bucket encoding (binary, not scaled)
+
+CRC32 hash of high-cardinality string values mapped to fixed-width buckets.
+Deterministic across runs (uses `zlib.crc32`, not `hash()`).
+
+| Source column | Buckets | Features produced |
+|---|---|---|
+| `Computer` | 16 | `Computer_hash_0` … `Computer_hash_15` |
+| `DestinationPortName` | 8 | `DestinationPortName_hash_0` … `DestinationPortName_hash_7` |
+
+### Section C — Flags (binary, not scaled)
+
+| Name | Description |
+|---|---|
+| `port_is_wellknown` | 1 if `DestinationPortName` is in the well-known set (HTTP, HTTPS, DNS, SSH, RDP, SMB, etc.) |
+
+### Section D — Frequency encoding (float, scaled)
+
+Proportion of events in the dataset with that value. Unseen values at
+inference time get frequency 0.0 (a useful anomaly signal — rare = suspicious).
+
+| Name | Source |
+|---|---|
+| `Computer_freq` | `Computer` |
+| `DestinationPortName_freq` | `DestinationPortName` |
+
+### Section E — Numerical features (float, scaled)
+
+| Name | Source | Description |
+|---|---|---|
+| `EventRecordID` | Raw column | ES internal record ID |
+| `Execution_ProcessID` | Raw column | PID at execution time |
+| `ProcessId` | Raw column | Process ID |
+| `SystemTime_day` | Parsed from `SystemTime` | Day of month (1–31) |
+| `SystemTime_hour` | Parsed from `SystemTime` | Hour of day (0–23) |
+| `SystemTime_minute` | Parsed from `SystemTime` | Minute (0–59) |
+
+### Section F — Temporal behaviour features (added by `sequence_builder`)
+
+Added **after** the scaler runs, z-scored on benign rows inside
+`_add_temporal_features`.
+
+| Name | Formula | Notes |
+|---|---|---|
+| `time_delta_seconds` | `diff(SystemTime)` per host, clipped ≥ 0 | 0 for first event per host |
+| `log_time_delta` | `log1p(time_delta_seconds)` | Compresses multi-hour idle gaps |
+| `event_burst_count` | Events on same host in [t−60s, t) | O(n log n) via `searchsorted` |
+
+### Derived columns (in DataFrame, not in feature matrix)
+
+These columns are written to the DataFrame for use by downstream modules
+(RarityEngine, graph builder) but are **not** part of the model feature vector:
+
+| Name | Used by |
+|---|---|
+| `process_name` | RarityEngine, graph_builder |
+| `parent_process` | RarityEngine |
+| `parent_child` | RarityEngine |
+
+---
+
+## 5. File Reference
 
 ---
 
@@ -256,175 +327,116 @@ convention.
 **Imported by:** Every other module.
 **Never modify any other file to change a number** — edit `config.py` instead.
 
+Key parameters:
+
 ```
-DATA_PATH                = "sysmondataless.csv"
+DATA_DIR                 = "/gulshan_data/anomaly_detection"
+ARTIFACTS_DIR            = "/home/rohit/elastic"
+DATA_PATH                = DATA_DIR + "/elastic_data.csv"
 RANDOM_SEED              = 42
 SEQUENCE_LENGTH          = 20         sliding-window length
 TRAIN_LABEL              = 0          label meaning "benign"
 BATCH_SIZE               = 512
 EPOCHS                   = 20         max transformer training epochs
 LEARNING_RATE            = 1e-3
-VAL_RATIO                = 0.15       fraction of benign seqs for validation
+VAL_RATIO                = 0.15
 EARLY_STOPPING_PATIENCE  = 5
 EMBED_DIM                = 96         transformer internal width
 NUM_HEADS                = 4
 NUM_LAYERS               = 2
-FF_DIM                   = 256        feed-forward sublayer width
-HIGH_SIGNAL_EVENTIDS     = [1, 3]
+FF_DIM                   = 256
+HIGH_SIGNAL_EVENTIDS     = None       None = use all events
 GNN_EMBED_DIM            = 64
 GNN_EPOCHS               = 15
 GNN_LR                   = 1e-3
-GNN_EARLY_STOPPING_PAT   = 5
-RECON_WEIGHT             = 0.45
-GRAPH_WEIGHT             = 0.00       disabled (GNN AUC 0.31 < random)
-RARITY_WEIGHT            = 0.55
-ALERT_THRESHOLD          = 0.40
+DENSE_HIDDEN_DIMS        = (128, 64, 32, 16)
+DENSE_EPOCHS             = 100
+DENSE_WEIGHT             = 0.50
+RECON_WEIGHT             = 0.20
+GRAPH_WEIGHT             = 0.00       disabled (GNN ablation AUC < random)
+RARITY_WEIGHT            = 0.30
+ALERT_PERCENTILE         = 97.5       percentile of benign scores → threshold
 ALERT_WINDOW             = 300        seconds
-LARGE_DATASET_THRESHOLD  = 200_000    events above which memmap mode is used
+LARGE_DATASET_THRESHOLD  = 200_000
 INFER_BATCH_SIZE         = 2048
-CMD_EMBED_MODEL          = "all-MiniLM-L6-v2"
-CMD_EMBED_N_COMPONENTS   = 32         PCA output dimension
-CMD_EMBED_BATCH_SIZE     = 256
-CMD_EMBED_CACHE_DIR      = ".cmd_embed_cache"
-CMD_EMBED_PCA_PATH       = "cmd_pca.pkl"
+HAS_GROUND_TRUTH         = False
 ```
 
 ---
 
 ### `main.py`
 
-**Role:** Orchestrates all nine pipeline steps from CSV load to metric output.
+**Role:** Orchestrates all ten pipeline steps from CSV load to report output.
 **Entry point:** `python main.py`
-
-**Step summary:**
 
 | Step | Action | Module called |
 |---|---|---|
-| 1 | Load CSV; filter to EventID 1 & 3; reset index | — |
-| 2 | Feature engineering | `feature_engineering.feature_engineering` |
-| 3 | Fit + apply StandardScaler (benign-only) | `normaliser.fit_scaler`, `apply_scaler` |
+| 1 | Load CSV; optional EventID filter; reset index | — |
+| 2 | Feature engineering (OHE + freq/hash encoding) | `feature_engineering.feature_engineering` |
+| 3 | Fit + apply MinMaxScaler (benign-only fit) | `normaliser.fit_scaler`, `apply_scaler` |
 | 4 | Build full + benign-only heterogeneous graphs | `graph_builder.build_event_graph` |
 | 5 | Train GNN on benign graph | `gnn_encoder.train_gnn` |
 | 6 | Compute per-event graph anomaly scores | `gnn_encoder.graph_anomaly_scores` |
 | 7 | Fit rarity engine; score all events | `rarity_engine.RarityEngine` |
-| 8 | Build sequences; train Transformer; compute recon errors | `sequence_builder`, `transformer_autoencoder`, `train`, `evaluate` |
-| 9 | Composite score; alerts; evaluation | `anomaly_engine`, `alert_aggregator`, `metrics` |
+| 8 | Train dense autoencoder; score all events | `dense_autoencoder.train_dense_ae` |
+| 9 | Build sequences; train Transformer; compute recon errors | `sequence_builder`, `transformer_autoencoder`, `train`, `evaluate` |
+| 10 | Composite score; alerts; report; evaluation | `anomaly_engine`, `alert_aggregator`, `anomaly_report`, `metrics` |
 
-**Score alignment (step 8):**
-`build_sequences` and `build_sequences_memmap` iterate hosts in the order they
-appear in the DataFrame. Window `j` on a host ends at host event index
-`j + SEQUENCE_LENGTH − 1`. The code maps each window score to that last event's
-position in the global `event_recon_errors` array. The first
-`SEQUENCE_LENGTH − 1 = 19` events per host are warmup and receive `NaN`.
-
-**Scaling decision:** `use_memmap = n_events > LARGE_DATASET_THRESHOLD (200 000)`
+**Score alignment (step 9):**
+`build_sequences` iterates hosts in DataFrame order. Window `j` on a host ends
+at host event index `j + SEQUENCE_LENGTH − 1`. Each window score maps to that
+last event's position. The first `SEQUENCE_LENGTH − 1 = 19` events per host
+are warmup and receive `NaN`.
 
 ---
 
 ### `feature_engineering.py`
 
-**Role:** Converts raw Sysmon rows into the 57-column numeric feature matrix.
-**Key output:** `(df, feature_cols)` where `feature_cols` is the ordered list
-of column names to pass to the model.
-**Module-level constant:** `N_CATEGORICAL_FEATURES = 6` — read by `normaliser.py`.
+**Role:** Converts raw event rows into a fixed-width numeric feature matrix.
 
-**Missing-column safety:** `_OPTIONAL_COLS` dict defines every optional Sysmon
-column with a safe default. Any column absent from the CSV is filled before
-feature computation, so the pipeline runs on any Sysmon config.
+**Encoding strategy:**
 
-**Categorical encoding:** CRC32 hashing
-```python
-hash_value = (zlib.crc32(s.encode("utf-8")) & 0xFFFFFFFF) / 0xFFFFFFFF
-```
-Stable across runs (no `PYTHONHASHSEED`), handles unseen categories at
-inference without error, always in [0, 1].
+| Column type | Encoding | Dimension |
+|---|---|---|
+| `Computer` (high-cardinality) | 1 frequency + 16 hash buckets | 17 (fixed) |
+| `DestinationPortName` (high-cardinality) | 1 frequency + 8 hash buckets + 1 well-known flag | 10 (fixed) |
+| Low-cardinality categoricals (7 cols) | OneHotEncoding | ~15–20 (bounded) |
+| Numerical (6 cols) | Pass-through | 6 |
+| **Total** | | **~48–53 (fixed)** |
 
-**Bug fixes in this file:**
-- `dest_external`: original bitwise `~` on an int Series yielded −1/−2.
-  Fixed by inverting the **bool** Series before `.astype(int)`.
-- RFC 1918: `172.*` captured public addresses.
-  Correct regex: `^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|127\.)`.
+**Why not OHE for everything:** With hundreds of unique hostnames or ports, OHE
+produces thousands of sparse binary columns, causing memory explosion, curse of
+dimensionality, and broken generalisation for unseen values. Frequency + hash
+encoding keeps the dimension fixed and handles unseen values gracefully
+(frequency=0 is itself an anomaly signal).
 
-**Semantic embeddings** (section 2b):
-```python
-_embs = embed_commandlines(df["CommandLine"].fillna("").astype(str))  # (N, 32)
-for i in range(CMD_EMBED_N_COMPONENTS):
-    df[f"cmd_emb_{i}"] = _embs[:, i]
-```
-The 32 columns are appended to `feature_cols` in the numeric section so they
-are z-scored by the StandardScaler.
+**Frequency maps** are saved to `freq_maps.pkl` for use during inference.
+**OHE encoder** is saved to `ohe_encoder.pkl`.
 
----
-
-### `commandline_embedding.py`
-
-**Role:** Provides PCA-compressed semantic representations of `CommandLine`
-strings using a pre-trained sentence-transformer model.
-
-**Public function:**
-```python
-embeddings = embed_commandlines(
-    cmd_series: pd.Series,
-    pca_path:   str = CMD_EMBED_PCA_PATH,
-    cache_dir:  str = CMD_EMBED_CACHE_DIR,
-) -> np.ndarray  # (N, 32), float32
-```
-
-**Internal pipeline:**
-```
-cmd_series  (N strings)
-    │
-    ▼  _cache_key(): SHA-256 of all strings in order → hex string
-    │
-    ├─ cache hit  → load (N, 384) raw embeddings from .cmd_embed_cache/<hash>.npy
-    └─ cache miss → SentenceTransformer("all-MiniLM-L6-v2").encode(
-                        texts, batch_size=256, convert_to_numpy=True)
-                    → save raw.npy for next run
-    │
-    ▼  PCA model
-    ├─ pca_path exists → joblib.load(pca_path)
-    └─ pca_path absent → PCA(n_components=32, random_state=42).fit(raw)
-                         → joblib.dump(pca, pca_path)
-    │
-    ▼  pca.transform(raw).astype(float32)  →  (N, 32)
-```
-
-**Why two tiers of caching:**
-- Raw 384-d embeddings take minutes to compute for large datasets.
-  A SHA-256 cache avoids re-encoding the same dataset on repeated runs.
-- The PCA model is stable after first fit; reloading it avoids non-determinism
-  from re-fitting on a subset in a different run.
-
-**Determinism guarantees:**
-- Model weights fixed (downloaded once from HuggingFace Hub).
-- `random_state=42` in PCA.
-- Cache key is order-sensitive; only exact same data in same order produces a hit.
+**Missing-column safety:** `_OPTIONAL_COLS` dict defines every optional column
+with a safe default. Any column absent from the CSV is filled before feature
+computation, so the pipeline runs on any endpoint data config.
 
 ---
 
 ### `normaliser.py`
 
-**Role:** Fits and applies a `StandardScaler` to the numeric portion of the
-feature matrix, leaving the CRC32-hashed categorical columns untouched.
+**Role:** Fits and applies a `MinMaxScaler` to the float portion of the feature
+matrix, leaving binary columns (OHE + hash buckets + flags) untouched.
 
 **Public API:**
 ```python
-scaler = fit_scaler(df, feature_cols)          # returns + saves scaler.pkl
-df     = apply_scaler(df, feature_cols, scaler)
-scaler = load_scaler()                          # reload for inference
+scaler = fit_scaler(df, feature_cols, n_ohe_cols)  # returns + saves scaler.pkl
+df     = apply_scaler(df, feature_cols, scaler, n_ohe_cols)
+scaler = load_scaler()                              # reload for inference
 ```
 
-**What is scaled:** `feature_cols[N_CATEGORICAL_FEATURES:]`
-(indices 6–56 — everything except the first 6 CRC32/rare-score columns).
-
-**What is NOT scaled here:**
-- Columns 0–5: already in [0, 1]; z-scoring hash values is meaningless.
-- Columns 57–59 (temporal): added inside `sequence_builder` after this step.
-  They are z-scored there on benign rows using the same convention.
+**What is scaled:** `feature_cols[n_ohe_cols:]` — frequency and numerical columns.
+**What is NOT scaled:** Binary columns at positions `0` to `n_ohe_cols-1`.
 
 **Benign-only fitting:** `scaler.fit(df[df["Label"] == TRAIN_LABEL][numeric_cols])`.
-This prevents attack feature distributions from widening the mean/std and
-making attack values appear closer to normal.
+Prevents attack feature distributions from widening the scale and making attack
+values appear closer to normal.
 
 ---
 
@@ -433,50 +445,18 @@ making attack values appear closer to normal.
 **Role:** Injects temporal features and builds overlapping sliding-window
 sequences of events per host.
 
-**Public API:**
-```python
-# Small datasets (< LARGE_DATASET_THRESHOLD events)
-X, y = build_sequences(df, feature_cols, seq_len)
-#   X: ndarray (N_seq, seq_len, n_features)  float32
-#   y: ndarray (N_seq,)                       int32
-
-# Large datasets (memmap path)
-n_seq, seq_shape = build_sequences_memmap(
-    df, feature_cols, seq_len, seq_path="sequences.dat", labels_path="seq_labels.dat"
-)
-y_mm   = load_seq_labels(labels_path, n_sequences)
-X_mm   = load_seq_memmap(seq_path, seq_shape)
-```
-
 **Temporal feature injection — `_add_temporal_features(df, feature_cols)`:**
-
-Called at the top of both build functions. Sorts df by `[Computer, SystemTime]`
-(required for `diff()` and `searchsorted` to be meaningful), computes three
-features, z-scores them on benign rows, then appends the names to `feature_cols`.
-
-```python
-_TEMPORAL_COLS = ["time_delta_seconds", "log_time_delta", "event_burst_count"]
-```
-
-`_burst_count` helper (per host):
-```python
-t_ns      = SystemTime.astype("datetime64[ns]").view(np.int64)
-window_ns = 60_000_000_000   # 60 s in nanoseconds
-counts    = searchsorted(t_ns, t_ns, "left")
-          - searchsorted(t_ns, t_ns - window_ns, "left")
-```
-O(n log n), no DatetimeIndex required, NaT timestamps replaced with epoch.
+Called at the top of both build functions. Sorts df by `[Computer, SystemTime]`,
+computes three features, z-scores them on benign rows, then appends the names
+to `feature_cols`.
 
 **Sliding windows** use `numpy.lib.stride_tricks.sliding_window_view` (zero-copy).
-Shape: `(n, n_features, seq_len)` → transposed to `(n, seq_len, n_features)`.
 Label: label of the **last** event in the window.
 
 **Memmap algorithm (large datasets):**
-1. Pass 1 — count total windows per host (O(n_hosts), no data loaded).
-2. Allocate two memmap files with the exact required shape.
-3. Pass 2 — write host-by-host. Peak RAM = one host's event matrix, not all
-   windows simultaneously.
-4. Flush to disk; delete memmap handles.
+1. Pass 1 — count total windows per host.
+2. Allocate two memmap files with exact required shape.
+3. Pass 2 — write host-by-host. Peak RAM = one host's event matrix.
 
 ---
 
@@ -486,51 +466,43 @@ Label: label of the **last** event in the window.
 
 **Architecture:**
 ```
-Input  (B, T=20, F=60)
+Input  (B, T=20, F)
   │
   ├─ input_proj: Linear(F, 96) + LayerNorm(96)
-  ├─ pos_enc: SinusoidalPositionalEncoding(96)   fixed, Vaswani et al. 2017
+  ├─ pos_enc: SinusoidalPositionalEncoding(96)
   ├─ encoder: TransformerEncoder(d=96, heads=4, layers=2, ff=256)
   ├─ mean-pool over T → (B, 96)
-  └─ bottleneck: Linear(96, 24)        ← forces compact representation
+  └─ bottleneck: Linear(96, 24)
 
 Bottleneck z  (B, 24)
   │
   ├─ bottleneck_expand: Linear(24, 96)
   ├─ broadcast to (B, T, 96) → memory
-  ├─ query_pos_enc(zeros(B, T, 96)) → positional query tokens
-  ├─ query_proj: Linear(96, 96)       ← dedicated query space for cross-attn
-  ├─ decoder_transformer: TransformerDecoder(d=96, heads=4, layers=2, ff=256)
-  │   cross-attends to memory
+  ├─ query tokens → query_proj: Linear(96, 96)
+  ├─ decoder: TransformerDecoder(d=96, heads=4, layers=2, ff=256)
   └─ output_proj: Linear(96, F)
 
-Output  (B, T=20, F=60)
-```
-
-**Key model parameters:**
-
-| Symbol | Value | Meaning |
-|---|---|---|
-| `EMBED_DIM` | 96 | Internal width |
-| `NUM_HEADS` | 4 | Attention heads |
-| `NUM_LAYERS` | 2 | Encoder and decoder layer count |
-| `FF_DIM` | 256 | Feed-forward sublayer width |
-| `bottleneck_dim` | `max(96//4, 16) = 24` | Compression bottleneck |
-
-**Public methods:**
-```python
-z   = model.encode(x)              # (B,T,F) → (B, 24)
-out = model.decode(z, seq_len=T)  # (B, 24)  → (B, T, F)
-out = model(x)                    # encode + decode
+Output  (B, T=20, F)
 ```
 
 **Training objective:** `MSELoss(output, input)` on benign sequences only.
 High MSE at inference = model cannot explain the sequence = anomaly.
 
-**Why `query_proj`:** Without it, the TransformerDecoder's queries are raw
-sinusoidal embeddings — fixed, with no learned content. `query_proj` gives the
-decoder a learned linear projection that acts as a position-aware "question" to
-ask the encoder memory, improving reconstruction specificity for unusual events.
+---
+
+### `dense_autoencoder.py`
+
+**Role:** Single-event dense (feedforward) autoencoder for sharp per-event
+anomaly detection without sequence dilution.
+
+**Architecture (validated at ROC-AUC 0.9950 standalone):**
+```
+Encoder: F → 128 → 64 → 32 → 16  (ReLU + LayerNorm)
+Decoder: 16 → 32 → 64 → 128 → F  (ReLU + LayerNorm, final sigmoid)
+```
+
+**Training:** MSE on benign events only. Adam with ReduceLROnPlateau scheduler.
+**Scoring:** Per-event MSE reconstruction error.
 
 ---
 
@@ -538,325 +510,225 @@ ask the encoder memory, improving reconstruction specificity for unusual events.
 
 **Role:** Two training entry points for the Transformer autoencoder.
 
-**`train_model(model, X_train, epochs, batch_size, lr, val_ratio, patience)`**
-In-memory path.
-
-- Shuffles `X_train` with `RANDOM_SEED`; holds out `val_ratio` fraction for validation.
-- **Optimiser:** `AdamW(lr, weight_decay=1e-4)`.
-- **Scheduler:** Linear warmup over first 10% of steps → cosine annealing to 0.
-  Stepped once per batch.
-- **AMP:** `torch.amp.autocast("cuda")` on GPU (no-op on CPU).
-- **Gradient clipping:** `clip_grad_norm_(max_norm=1.0)`.
-- **Early stopping:** Monitors val loss (or train loss if no val set). Saves
-  best weights with `copy.deepcopy`. Restores on exit.
-
-**`train_model_large(model, seq_path, seq_shape, train_indices, ...)`**
-Disk-backed path.
-
-- Uses `MemmapDataset` (custom `torch.utils.data.Dataset`) that reads from a
-  read-only `np.memmap`. `train_indices` selects benign rows without loading
-  the full file. Each `__getitem__` calls `.copy()` because PyTorch cannot own
-  memmap-backed memory.
-- Otherwise identical optimiser, scheduler, AMP, clipping, and early-stopping.
-- Peak RAM = one batch of sequences at a time.
+- **`train_model`** — in-memory path. AdamW + linear warmup + cosine annealing.
+  AMP, gradient clipping, early stopping.
+- **`train_model_large`** — disk-backed path. `MemmapDataset` reads from
+  `np.memmap`. Peak RAM = one batch at a time.
 
 ---
 
 ### `evaluate.py`
 
 **Role:** Batched inference — computes per-sequence MSE reconstruction error.
-
-**Public API:**
-```python
-scores = anomaly_scores(model, X, batch_size=512)
-# → ndarray (N_seq,)  float32 — MSE per sequence
-```
-
-- `X` may be `np.ndarray` (in-memory) or `np.memmap` (disk-backed); both are
-  sliced chunk-by-chunk with `np.array(slice)` to materialise memmap chunks.
-- MSE computed in float32 (`recon.float()`) even under AMP to avoid FP16
-  precision loss in the error metric.
-- AMP autocast is active during inference for consistent GPU behaviour.
-- Progress printed every 100 batches.
+Handles both in-memory `ndarray` and disk-backed `memmap` inputs.
 
 ---
 
 ### `rarity_engine.py`
 
 **Role:** Scores how rarely each event's behavioural patterns appeared during
-benign training, using three complementary sub-signals.
+benign training. Three sub-signals averaged per event:
 
-**Class `RarityEngine`:**
-```python
-engine = RarityEngine().fit(df)          # fit on Label==0 rows
-scores = engine.score_dataframe(df)      # → ndarray (N,)  float32 ∈ [0, 1]
-score  = engine.score_row(row)           # single event (calls score_dataframe)
-```
-
-**Three sub-signals (per-event mean over whichever are non-NaN):**
-
-| Signal | Pair tracked | Non-NaN condition |
-|---|---|---|
-| `parent_child` | `(parent_process_name, child_process_name)` | Both `Image` and `ParentImage` non-null |
-| `proc_ip` | `(process_name, DestinationIp)` | Both non-null |
-| `network_dest` | `DestinationIp` | Non-null |
+| Signal | Pair tracked |
+|---|---|
+| `parent_child` | `(parent_process_name, child_process_name)` |
+| `proc_ip` | `(process_name, DestinationIp)` |
+| `network_dest` | `DestinationIp` |
 
 **Scoring formula (Jeffreys / α=0.5 smoothing):**
 ```
 p(pattern) = (count + 0.5) / (total_count + 0.5 × vocab_size)
 rarity     = 1 − p(pattern)
 ```
-Unseen patterns get `count=0` → high rarity close to 1 without being exactly 1.
-Smoothing prevents zero-division and gives stable scores on small datasets.
 
-**Scalability:** All operations are vectorised via pandas `groupby` + `merge`.
-No Python-level row iteration. Safe for millions of events.
+All operations vectorised via pandas `groupby` + `merge`. Safe for millions
+of events.
 
 ---
 
 ### `graph_builder.py`
 
-**Role:** Converts the event DataFrame into a `torch_geometric.data.HeteroData`
-heterogeneous graph for the GNN.
+**Role:** Converts events into `torch_geometric.data.HeteroData` graph.
 
 **Node types:** `process`, `ip`, `user`, `host`.
-Each node is identified by a unique string key (image path, IP string, username,
-computer name). Node feature vectors aggregate event statistics for that entity.
+**Edge types (bidirectional):** `parent_of`, `connects_to`, `runs_as`, `runs_on`
+(+ reverses for bidirectional message-passing).
 
-**Edge types (bidirectional):**
-
-| Forward | Reverse |
-|---|---|
-| `(process, parent_of, process)` | `(process, rev_parent_of, process)` |
-| `(process, connects_to, ip)` | `(ip, rev_connects_to, process)` |
-| `(process, runs_as, user)` | `(user, rev_runs_as, process)` |
-| `(process, runs_on, host)` | `(host, rev_runs_on, process)` |
-
-Reverse edges are required for bidirectional message-passing in GraphSAGE.
-
-**Shared encoders:** `build_event_graph(df, encoders=None)` returns
-`(HeteroData, encoders_dict)`. When called twice — once for the full graph and
-once for the benign-only graph — the **same `encoders` dict** is passed to the
-second call so both graphs have identical node orderings. This is critical for
-mapping GNN process embeddings back to event rows.
-
-**`node_feature_dims(graph) → dict[str, int]`** returns the input feature
-dimension per node type; used to construct `HeteroGNNEncoder`.
+**Shared encoders:** Both full and benign graphs use the same encoders so node
+orderings match and GNN embeddings map correctly back to events.
 
 ---
 
 ### `gnn_encoder.py`
 
-**Role:** Defines `HeteroGNNEncoder`, its training, and per-event score
-computation.
+**Role:** Two-layer heterogeneous GraphSAGE encoder.
 
-**Architecture — two-layer heterogeneous GraphSAGE:**
-```
-x_dict  (per node type: Tensor(N_type, fdim))
-  │
-  ├─ input_projs[ntype]: Linear(fdim, 64)   project to common embedding space
-  │
-  ├─ conv1: HeteroConv(SAGEConv per edge type, aggr="mean") + ReLU
-  │    nodes with no incoming edges fall back to projected input features
-  │
-  ├─ conv2: HeteroConv(SAGEConv per edge type, aggr="mean") + LayerNorm
-  │
-Embeddings h_dict  (per node type: Tensor(N_type, 64))
-  │
-  └─ decoders[ntype]: Linear(64, fdim)   reconstruct original features
-```
+**Training:** Benign-only graph, MSE reconstruction loss.
+**Inference:** Benign node features + full graph topology. Per-process MSE
+normalised to [0, 1].
 
-**Training (`train_gnn`):**
-- Trains on the **benign-only graph** only.
-- Loss: `sum(MSE(decoded[ntype], x_dict[ntype]))` across all node types.
-- Optimiser: Adam. AMP + gradient clipping. Early stopping on training loss.
-
-**Inference (`graph_anomaly_scores`):**
-- `x_dict` = **benign node features** (attack-only processes → zero vectors).
-- `edge_index_dict` = **full graph topology** (attack edges are the signal).
-- Returns per-process-node MSE, normalised to [0, 1]:
-  `(recon_err − min) / (max − min + 1e-8)`.
-- Scores are mapped to events via the process node encoder.
-
-**Current status:** `GRAPH_WEIGHT = 0.00`. Ablation showed ROC-AUC = 0.31,
-worse than random (0.50). The code is retained and can be re-enabled by
-setting a non-zero weight in `config.py`.
+**Current status:** `GRAPH_WEIGHT = 0.00`. Ablation ROC-AUC = 0.31 (worse than
+random). Code retained for future improvement.
 
 ---
 
 ### `anomaly_engine.py`
 
-**Role:** Fuses the three per-event score arrays into one composite score.
+**Role:** Fuses four per-event score arrays into one composite score.
 
-**Public API:**
-```python
-composite = compute_anomaly_scores(
-    recon_errors,   # (N,) float32 — NaN for warmup events
-    graph_scores,   # (N,) float32
-    rarity_scores,  # (N,) float32
-    labels,         # (N,) int  — for benign-only normalisation fit
-) -> np.ndarray   # (N,) float32 ∈ [0, 1]
-```
-
-**Normalisation (`_normalise`):**
-- Min-max, fitted on benign rows only (prevents attack ranges from compressing scores).
-- `max == min` → return zeros (constant signal).
-- NaN entries (recon_error warmup) → fill 0 after normalisation.
+**Normalisation:** Min-max, fitted on benign rows only.
 
 **Composite formula:**
 ```
-scored events   →  0.45·r + 0.00·g + 0.55·s
-warmup events   →  s
+scored events  →  0.50·dense + 0.20·recon + 0.00·graph + 0.30·rarity
+warmup events  →  recon weight redistributed to remaining active signals
 ```
-Where `r`, `g`, `s` are the normalised reconstruction, graph, and rarity
-signals respectively. `remain = GRAPH_WEIGHT + RARITY_WEIGHT = 0.55`.
-Warmup events get `(RARITY_WEIGHT / remain)·s = s`, preserving the [0, 1]
-ceiling across both groups.
 
 ---
 
 ### `alert_aggregator.py`
 
-**Role:** Groups high-scoring events into human-readable attack-chain records.
+**Role:** Groups high-scoring events into attack-chain records per host.
+Consecutive flagged events within `ALERT_WINDOW` seconds are merged into
+one chain.
 
-**Public API:**
-```python
-alerts_df = aggregate_alerts(df, scores, threshold=ALERT_THRESHOLD,
-                             window_sec=ALERT_WINDOW)
-# → pd.DataFrame  columns:
-#   chain_id, host, start_time, end_time, duration_s, num_events,
-#   max_score, mean_score, processes, dest_ips, labels
-```
+---
 
-**Algorithm:**
-1. Flag events where `score >= threshold` (default 0.40).
-2. Drop events with NaT `SystemTime`.
-3. Process each host independently (events from different machines never merge).
-4. Within each host: sort by `SystemTime`; iterate and start a new chain
-   whenever the time gap to the previous flagged event exceeds `window_sec`.
-5. Summarise each chain:
-   - `processes`: deduplicated process names in order of appearance.
-   - `dest_ips`: deduplicated destination IPs.
-   - `labels`: deduplicated labels (reveals if the chain contains attack events).
+### `anomaly_report.py`
+
+**Role:** Generates human-readable investigation outputs for manual triage.
+
+**Outputs:**
+- `anomaly_report.txt` — narrative report: executive summary, alert chain
+  summaries, per-host flagged event listings, "why suspicious" hints.
+- `flagged_events.csv` — all flagged events with full context, sorted by score.
+
+Always generated regardless of ground truth availability.
+
+---
+
+### `relabel_anomalies.py`
+
+**Role:** Utility to promote evaluation events from Label=2 to Label=1
+(confirmed attack) after manual review.
+
+**Labelling strategies:**
+- `--host` — flag all events from a specific machine
+- `--process` — flag events matching a process name substring
+- `--ip` — flag network events connecting to a suspicious IP
+- `--time` — flag events in a specific time window
+- `--ids` — flag specific row indices from anomaly_scores.csv
+- `--query` — arbitrary pandas query string
+
+After relabelling, set `HAS_GROUND_TRUTH = True` in `config.py` and re-run
+`main.py` for AUC/F1 evaluation metrics.
 
 ---
 
 ### `metrics.py`
 
-**Role:** Research-paper-grade evaluation of anomaly detection performance.
+**Role:** Research-paper-grade evaluation (only when `HAS_GROUND_TRUTH = True`).
 
-**Public API:**
-```python
-metrics = evaluate(df_scores, df_alerts=None, df_events=None,
-                   report_path="threshold_sweep.csv") -> dict
-```
-
-`df_scores` must contain: `score`, `recon_error`, `graph_score`,
-`rarity_score`, `label`.
-
-**Label convention:** 0 = benign, 1 = confirmed attack, 2 = suspicious.
 Binary evaluation: `label > 0` is positive.
 
-**Metrics computed:**
-
-| Category | Metrics |
-|---|---|
-| Ranking | ROC-AUC, PR-AUC |
-| Per-component ablation | ROC-AUC for `recon_error`, `graph_score`, `rarity_score`, `score` |
-| F1-optimal threshold | Precision, Recall, F1, Accuracy, MCC, Cohen's Kappa, G-Mean, TP/FP/FN/TN, FPR, FNR |
-| Youden-J threshold | Same as above |
-| Operational TPR table | TPR at FPR = 0.1%, 0.5%, 1%, 5%, 10% |
-| Threshold sweep | All binary metrics at every threshold 0.00→1.00 step 0.01 |
-| Alert-level | Alert Precision, Alert Recall, chain count |
-| Per-label stats | mean, std, median, p25, p75, p95, p99 per class |
-
-**NaN handling:** `_safe_auc` filters NaN score rows before calling sklearn
-(warmup events have `recon_error = NaN`), preventing `ValueError`.
-
-**Output files:**
-
-| File | Contents |
-|---|---|
-| `metrics.json` | All scalar metrics — import into paper Table 1 |
-| `roc_curve.csv` | `fpr, tpr, threshold` — Figure: ROC curve |
-| `pr_curve.csv` | `precision, recall, threshold` — Figure: PR curve |
-| `score_distributions.csv` | Per-class score statistics |
-| `threshold_sweep.csv` | Full 101-row sweep table |
+**Metrics computed:** ROC-AUC, PR-AUC, per-component ablation AUCs,
+F1-optimal threshold, Youden-J threshold, operational TPR table,
+101-point threshold sweep, alert-level precision/recall, per-label statistics.
 
 ---
 
-## 5. Composite Scoring Formula
+### `rescore.py`
+
+**Role:** Quick re-evaluation without retraining. Reloads saved model weights
+and recomputes anomaly scores with potentially different weights or thresholds.
+
+---
+
+## 6. Composite Scoring Formula
 
 ```
-composite_score[i] = RECON_WEIGHT  × norm(recon_error[i])
+composite_score[i] = DENSE_WEIGHT  × norm(dense_error[i])
+                   + RECON_WEIGHT  × norm(recon_error[i])
                    + GRAPH_WEIGHT  × norm(graph_score[i])
                    + RARITY_WEIGHT × norm(rarity_score[i])
 
-                   = 0.45 × norm(recon_error[i])
+                   = 0.50 × norm(dense_error[i])
+                   + 0.20 × norm(recon_error[i])
                    + 0.00 × norm(graph_score[i])
-                   + 0.55 × norm(rarity_score[i])
+                   + 0.30 × norm(rarity_score[i])
 ```
 
 `norm(x)` = min-max normalisation, range fitted on benign events only.
 
 **Warmup events** (first 19 per host, `recon_error = NaN`):
-```
-composite_score[i] = norm(rarity_score[i])
-```
-
-This preserves the same [0, 1] ceiling as fully-scored events so the
-`ALERT_THRESHOLD = 0.40` applies uniformly.
+`RECON_WEIGHT` is redistributed proportionally among the remaining active
+signals so the composite still spans [0, 1].
 
 ---
 
-## 6. Key Design Decisions
+## 7. Key Design Decisions
 
 | Decision | Rationale |
 |---|---|
 | **Unsupervised / benign-only training** | Attack samples are rare and evolve constantly; modelling normality generalises to novel attacks |
-| **Three-signal ensemble** | Each signal has blind spots; fusion reduces both false positives and false negatives |
-| **Global EventID 1 & 3 filter** | These event types carry the strongest attack signal. Applied once at load so all engines, training, and evaluation operate on the same consistent subset |
-| **CRC32 categorical hashing** | Deterministic across runs; handles unseen categories at inference; no fit/transform step |
-| **Benign-only scaler + normalisation** | Prevents attack feature distributions from distorting the baseline, which would compress anomaly gaps and reduce separability |
-| **Semantic command-line embeddings** | Captures similarity between functionally-equivalent commands that binary flags miss entirely (e.g. different base64-encoded payloads) |
-| **Temporal burst features** | `event_burst_count` detects process-creation storms common in exploit chains; `log_time_delta` flags sudden bursts after long idle periods |
+| **Four-signal ensemble** | Each signal has blind spots; fusion reduces both false positives and false negatives |
+| **Frequency + hash encoding for high-cardinality columns** | OHE explodes with hundreds of machines/ports; hash encoding gives fixed-width features; frequency encoding provides useful signal (rare host = anomaly) |
+| **OHE only for low-cardinality columns** | Bounded unique values (EventID, boolean flags, time parts) — OHE is safe and expressive |
+| **Benign-only scaler + normalisation** | Prevents attack feature distributions from widening the mean/range and making attack values appear closer to normal |
+| **Streaming CSV ingestion** | Never holds more than one page (~5,000 rows) in memory; handles multi-million event datasets |
+| **`--eval-only` mode** | Allows adding new evaluation periods without re-ingesting training data |
+| **Label=2 as routing marker** | Not a ground-truth annotation — tells the pipeline "score but don't train on these rows" |
+| **Dense AE as primary signal (weight=0.50)** | Validated at ROC-AUC 0.9950 standalone; sharp per-event signal without sequence dilution |
+| **Temporal burst features** | `event_burst_count` detects process-creation storms; `log_time_delta` flags sudden bursts after idle periods |
 | **Sinusoidal PE (not learned)** | Stable on short sequences (20 events); no over-fitting of position parameters |
-| **True TransformerDecoder with cross-attention** | Each decoded position attends to the full encoder memory, giving a richer reconstruction signal than a second encoder |
-| **Compressed bottleneck (embed_dim//4 = 24)** | Forces meaningful compression; prevents the identity shortcut where all sequences are trivially reconstructed |
-| **`query_proj` before cross-attention** | Gives the decoder a learned linear projection as "questions" to ask the encoder, improving specificity for unusual event patterns |
-| **Warmup event handling** | Redistributes weight so warmup events have the same composite score ceiling as fully-scored events; alert threshold is fair for all events |
+| **True TransformerDecoder with cross-attention** | Richer reconstruction than a second encoder; each decoded position attends to full encoder memory |
+| **Compressed bottleneck (embed_dim//4 = 24)** | Forces meaningful compression; prevents identity shortcut |
 | **GNN weight = 0** | Ablation ROC-AUC = 0.31 (worse than random); architecture retained for future improvement |
-| **Memmap for large datasets** | Two-pass algorithm: count windows first (O(n_hosts)), then write host-by-host. Peak RAM = one host's events |
-| **Benign features + full GNN topology** | Attack-only processes have zero feature vectors and appear anomalous even in the benign feature space; attack-introduced edges are the structural signal |
-| **Host-scoped alert chains** | Events from different machines are never merged; consistent with real-world incident response scoping |
+| **Memmap for large datasets** | Two-pass algorithm; peak RAM = one host's events, not all windows |
 | **Jeffreys smoothing in Rarity Engine** | Prevents zero probabilities for unseen patterns; stable on small datasets |
+| **Host-scoped alert chains** | Events from different machines never merge; consistent with incident response scoping |
+| **Investigation report always generated** | Enables manual triage even without ground-truth labels |
 
 ---
 
-## 7. Artifacts on Disk
+## 8. Artifacts on Disk
+
+### ARTIFACTS_DIR (model weights, reports — typically < 1 GB)
 
 | File | Produced by | Description |
 |---|---|---|
-| `scaler.pkl` | `normaliser.fit_scaler` | Fitted StandardScaler (joblib) |
-| `cmd_pca.pkl` | `commandline_embedding` | Fitted PCA model 384→32 (joblib) |
-| `.cmd_embed_cache/<sha256>.npy` | `commandline_embedding` | Cached raw 384-d embeddings |
-| `gnn_encoder.pt` | `gnn_encoder.train_gnn` | Trained GNN state dict (PyTorch) |
-| `transformer_autoencoder.pt` | `train.train_model` | Trained Transformer state dict (PyTorch) |
-| `sequences.dat` | `sequence_builder` | All sliding-window sequences as np.memmap (large datasets) |
-| `seq_labels.dat` | `sequence_builder` | Corresponding sequence labels as np.memmap |
-| `anomaly_scores.csv` | `main` | Per-event: score, recon_error, graph_score, rarity_score, label |
+| `scaler.pkl` | `normaliser.fit_scaler` | Fitted MinMaxScaler (joblib) |
+| `ohe_encoder.pkl` | `feature_engineering` | Fitted OHE for low-cardinality columns |
+| `freq_maps.pkl` | `feature_engineering` | Frequency maps for high-cardinality columns |
+| `gnn_encoder.pt` | `gnn_encoder.train_gnn` | Trained GNN state dict |
+| `dense_autoencoder.pt` | `dense_autoencoder.train_dense_ae` | Trained dense AE state dict |
+| `transformer_autoencoder.pt` | `train.train_model` | Trained Transformer state dict |
 | `alerts.csv` | `alert_aggregator` | Attack chain summaries |
+| `anomaly_report.txt` | `anomaly_report` | Narrative investigation report |
+| `flagged_events.csv` | `anomaly_report` | Flagged events with full context |
 | `metrics.json` | `metrics.evaluate` | All scalar evaluation metrics |
 | `roc_curve.csv` | `metrics.evaluate` | ROC curve data points |
 | `pr_curve.csv` | `metrics.evaluate` | PR curve data points |
 | `score_distributions.csv` | `metrics.evaluate` | Per-class score statistics |
 | `threshold_sweep.csv` | `metrics.evaluate` | Full 101-row threshold sweep |
 
+### DATA_DIR (bulk data — potentially tens of GB)
+
+| File | Produced by | Description |
+|---|---|---|
+| `elastic_data.csv` | `elastic_ingest.py` | Combined training + eval event CSV |
+| `anomaly_scores.csv` | `main.py` | Per-event scores (all components + label) |
+| `sequences.dat` | `sequence_builder` | Sliding-window sequences (np.memmap) |
+| `seq_labels.dat` | `sequence_builder` | Sequence labels (np.memmap) |
+
 ---
 
-## 8. Configuration Quick Reference
+## 9. Configuration Quick Reference
 
 All pipeline behaviour is controlled by **`config.py`** exclusively.
+Ingestion is controlled by **`elastic_config.yml`**.
+
+### Pipeline parameters (`config.py`)
 
 | Parameter | Default | Effect of increasing |
 |---|---|---|
@@ -864,29 +736,55 @@ All pipeline behaviour is controlled by **`config.py`** exclusively.
 | `EMBED_DIM` | 96 | More capacity; slower; risk of over-fitting on benign data |
 | `EPOCHS` | 20 | More training; early stopping usually triggers before this |
 | `BATCH_SIZE` | 512 | Larger GPU batches; may need reduction on small VRAM |
-| `RECON_WEIGHT` | 0.45 | More weight on Transformer signal |
-| `RARITY_WEIGHT` | 0.55 | More weight on rarity signal |
+| `DENSE_WEIGHT` | 0.50 | More weight on dense AE per-event signal |
+| `RECON_WEIGHT` | 0.20 | More weight on Transformer sequence signal |
+| `RARITY_WEIGHT` | 0.30 | More weight on rarity signal |
 | `GRAPH_WEIGHT` | 0.00 | Re-enable GNN contribution (re-validate first) |
-| `ALERT_THRESHOLD` | 0.40 | Higher = fewer alerts, higher precision, lower recall |
+| `ALERT_PERCENTILE` | 97.5 | Higher = fewer alerts, higher precision, lower recall |
 | `ALERT_WINDOW` | 300 s | Wider = longer chains; may merge unrelated events |
 | `LARGE_DATASET_THRESHOLD` | 200,000 | Lower to force memmap earlier |
-| `CMD_EMBED_N_COMPONENTS` | 32 | Richer embeddings; slightly wider feature vector |
+| `HAS_GROUND_TRUTH` | False | Set True after relabelling to enable AUC/F1 metrics |
+
+### Ingestion parameters (`elastic_config.yml`)
+
+| Parameter | Description |
+|---|---|
+| `host` | Elasticsearch URL |
+| `sources` | List of data sources: `defend`, `sysmon`, `wazuh` |
+| `train_start` / `train_end` | Training (benign) date window |
+| `eval_start` / `eval_end` | Evaluation date window |
+| `page_size` | Hits per search_after page (default 5000) |
+| `output_path` | Path for the merged CSV |
 
 ---
 
-## 9. How to Run
+## 10. How to Run
 
 ```bash
-# Install dependencies
+# 1. Install dependencies
 pip install -r requirements.txt
 
-# Place your Sysmon CSV at the DATA_PATH in config.py (default: sysmondataless.csv)
-# Run the full pipeline
+# 2. Configure elastic_config.yml with your ES connection + date windows
+
+# 3. Ingest data from Elasticsearch
+python elastic_ingest.py                    # fresh ingestion
+python elastic_ingest.py --eval-only        # add eval window to existing CSV
+
+# 4. Run the full pipeline
 python main.py
+
+# 5. Review results
+#    → anomaly_report.txt    (narrative triage report)
+#    → flagged_events.csv    (flagged events for spreadsheet review)
+#    → alerts.csv            (attack chain summaries)
+
+# 6. (Optional) Relabel confirmed attacks for evaluation metrics
+python relabel_anomalies.py --host WORKSTATION-04
+python relabel_anomalies.py --process "mimikatz"
+# Then set HAS_GROUND_TRUTH = True in config.py and re-run main.py
 ```
 
-The pipeline will print step-by-step progress and write all artifacts listed
-in §7 to the current directory.
-
-**To change any setting** (threshold, weights, model size, embedding dimensions):
-edit `config.py` only. No other file needs modification.
+**To diagnose empty results from Elasticsearch:**
+```bash
+python diagnose_elastic.py --config elastic_config.yml
+```
